@@ -1,22 +1,26 @@
-/* The eight read-only tools. Each handler returns JSON; labels.js pre-substitutes any
-   {0}/{1} template the lib returns so the LLM gets final text, not template strings.
-   ISO dates are validated on the way in; the handlers never see 'yesterday'. */
+/* The tools: read tools return JSON; write tools persist through state.writeState (atomic
+   write, rolling backup, _ts stamp so an open app tab adopts the change instead of
+   overwriting it). labels.js pre-substitutes any {0}/{1} template the lib returns so the
+   LLM gets final text, not template strings. ISO dates are validated on the way in; the
+   handlers never see 'yesterday'. */
+import crypto from 'node:crypto'
 import { z } from 'zod'
-import { getState, getUser } from './state.js'
+import { getState, getUser, writeState, updateMeta, readMeta, writeMeta } from './state.js'
 import {
   fmt, setLabel, exLine, muscleName, policyName, friendlyDuration, ratio, muscleOrder
 } from './labels.js'
 import {
-  modeOf, workoutVolume, setsDone, effectiveRoutine, effectiveRoutineIds, lastEntryFor, workoutAt
+  modeOf, workoutVolume, setsDone, effectiveRoutine, effectiveRoutineIds, lastEntryFor, workoutAt, repStep as repStepOf
 } from '../../frontend/src/lib/history.js'
 import { queueView, queueNext, pinState } from '../../frontend/src/lib/queue.js'
-import { exOr, registerCustom } from '../../frontend/src/lib/exercises.js'
+import { EXIDX, EXDB, exOr, registerCustom } from '../../frontend/src/lib/exercises.js'
 import { isWarmupRow, isFailureSet } from '../../frontend/src/lib/workout-model.js'
 import {
   bestSetOf, best1RM, e1rmSeries, DEFAULT_FORMULA, REP_CAP
 } from '../../frontend/src/lib/onerm.js'
 import { loadOfWorkouts, rankOf, levelsOf } from '../../frontend/src/lib/muscles.js'
-import { policyFor } from '../../frontend/src/lib/progression.js'
+import { policyFor, defaultIncrement, DEFAULT_SEC_INCREMENT, snapWeight } from '../../frontend/src/lib/progression.js'
+import { deleteRoutine as deleteRoutineInState } from '../../frontend/src/lib/routines.js'
 import { buildSessionEntries, startsFromLast } from '../../frontend/src/lib/session-start.js'
 
 /* ---------- helpers ---------- */
@@ -670,10 +674,583 @@ export const previewSession = {
   }
 }
 
+
+/* ---------- write helpers ---------- */
+
+
+// The exercise catalog is EXDB + the user's custom exercises. The app merges customs into
+// EXIDX via registerCustom; the MCP must do the same before validating exercise ids, or a
+// routine built around a custom exercise would be rejected as "unknown".
+function withCustomExercises(S) {
+  registerCustom(S.customEx || [])
+}
+
+function requireRoutine(S, routine_id) {
+  const r = (S.routines || []).find(x => x.id === routine_id)
+  if (!r) { const e = new Error(`no routine with id ${JSON.stringify(routine_id)}`); e.code = 'ENOENT'; throw e }
+  return r
+}
+
+function requireExercise(r, exercise_id) {
+  const cfg = (r.ex || []).find(x => x.id === exercise_id)
+  if (!cfg) { const e = new Error(`no exercise ${JSON.stringify(exercise_id)} in routine ${JSON.stringify(r.name)}`); e.code = 'ENOENT'; throw e }
+  return cfg
+}
+
+function assertKnownExercise(id) {
+  if (!EXIDX[id]) { const e = new Error(`unknown exercise id ${JSON.stringify(id)} — not in the exercise catalog`); e.code = 'EINVAL'; throw e }
+}
+
+// The scaled copy of a routine's exercises a deload applies: weight × factor (snapped to the
+// exercise's increment), sets rounded down (never below 1). Reps and time targets stay put —
+// a deload cuts load and volume, not the rep scheme.
+function scaleExercises(ex, factor) {
+  return (ex || []).map(cfg => {
+    const o = { ...cfg }
+    if (o.weight > 0) o.weight = snapWeight(o.weight * factor, o.inc > 0 ? o.inc : 1)
+    if (o.sets > 1) o.sets = Math.max(1, Math.round(o.sets * factor))
+    return o
+  })
+}
+
+const POLICY_ENUM = ['off', 'linear', 'greyskull', 'double', 'time']
+
+// One exercise config as the write tools accept it. weight may be 0 (bodyweight work); sets
+// must be ≥ 1; inc must be positive when given. Mode-specific fields (sec/min/speed) are
+// optional and only meaningful for their mode — the app's modeOf() decides from the id.
+const exerciseSchema = z.object({
+  id: z.string().min(1),
+  mode: z.enum(['reps', 'time', 'cardio']).optional().describe('How the exercise is logged. Defaults to reps (or cardio for cardio-catalog exercises). Timed holds (plank, farmer\'s carry) need mode: "time".'),
+  sets: z.number().int().min(1).optional(),
+  reps: z.number().int().min(1).optional(),
+  repsMin: z.number().int().min(1).optional(),
+  repsMax: z.number().int().min(1).optional(),
+  weight: z.number().min(0).optional(),
+  inc: z.number().positive().optional(),
+  sg: z.string().optional(),
+  policy: z.enum(POLICY_ENUM).optional(),
+  sec: z.number().positive().optional(),
+  min: z.number().positive().optional(),
+  speed: z.number().positive().optional()
+})
+
+/* ---------- the 7 write tools ---------- */
+
+/** create_routine — a new routine with its exercise list. */
+export const createRoutine = {
+  name: 'create_routine',
+  description: 'Create a new workout routine with a name and a list of exercises, each with set/rep/weight targets (and optional increment, superset group, or per-exercise progression policy). Exercise ids must come from the catalog (get_routine/list_routines return them). Persists directly into the openGym state.',
+  schema: {
+    name: z.string().min(1).describe('Routine name, e.g. "Push Day".'),
+    emoji: z.string().optional().describe('Optional emoji shown next to the routine name.'),
+    prog: z.enum(POLICY_ENUM).optional().describe('Default progression policy for the routine.'),
+    exercises: z.array(exerciseSchema).min(1).describe('Exercises with their targets. At least one.')
+  },
+  handler: ({ name, emoji, prog, exercises }) => {
+    const S = getState()
+    if (!S) return noState()
+    // Handler-level validation: the SDK applies the zod schema before the handler in
+    // production, but the handler is the last line of defence for destructive writes.
+    if (!exercises || !exercises.length) {
+      const e = new Error('create_routine needs at least one exercise')
+      e.code = 'EINVAL'
+      throw e
+    }
+    withCustomExercises(S)
+    exercises.forEach(e => assertKnownExercise(e.id))
+    const id = crypto.randomUUID()
+    return writeState(st => {
+      st.routines = [...(st.routines || []), { id, name, emoji: emoji || null, ...(prog ? { prog } : {}), ex: exercises.map(e => ({ ...e })) }]
+      return st
+    }).then(() => ({ id, name, exercise_count: exercises.length }))
+  }
+}
+
+/** update_routine — replace the structure of an existing routine. */
+export const updateRoutine = {
+  name: 'update_routine',
+  description: 'Replace the structure of an existing routine: name, emoji, default policy, and/or the full exercise list. Exercises not listed are removed — pass the complete desired exercise list. Use routine_id from list_routines.',
+  schema: {
+    routine_id: z.string().min(1),
+    name: z.string().min(1).optional(),
+    emoji: z.string().nullable().optional(),
+    prog: z.enum(POLICY_ENUM).nullable().optional(),
+    exercises: z.array(exerciseSchema).min(1).optional()
+  },
+  handler: ({ routine_id, name, emoji, prog, exercises }) => {
+    const S = getState()
+    if (!S) return noState()
+    requireRoutine(S, routine_id)
+    if (exercises) {
+      withCustomExercises(S)
+      exercises.forEach(e => assertKnownExercise(e.id))
+    }
+    return writeState(st => {
+      const r = requireRoutine(st, routine_id)
+      if (name != null) r.name = name
+      if (emoji !== undefined) r.emoji = emoji
+      if (prog !== undefined) r.prog = prog || undefined
+      if (exercises) r.ex = exercises.map(e => ({ ...e }))
+      return st
+    }).then(() => ({ routine_id, name: name ?? requireRoutine(S, routine_id).name, exercise_count: exercises ? exercises.length : undefined }))
+  }
+}
+
+/** delete_routine — remove a routine and its week-plan assignments. */
+export const deleteRoutine = {
+  name: 'delete_routine',
+  description: 'Delete a routine and remove it from the week plan (a weekday that held only this routine becomes rest; a combined day keeps its other routines) and from any per-date reschedule. Irreversible — the pre-write backup in the MCP metadata file is the only recovery path.',
+  schema: { routine_id: z.string().min(1) },
+  handler: ({ routine_id }) => {
+    const S = getState()
+    if (!S) return noState()
+    requireRoutine(S, routine_id)
+    return writeState(st => {
+      // The app's own delete: pulls the id out of every weekday's routine list (a combined
+      // day keeps its other routines), and drops per-date reschedules that name it.
+      st.routines = st.routines || []
+      deleteRoutineInState(st, routine_id)
+      return st
+    }).then(() => ({ deleted: routine_id }))
+  }
+}
+
+/** progress_exercise — raise weight and/or reps of one exercise in a routine. */
+export const progressExercise = {
+  name: 'progress_exercise',
+  description: 'Progress one exercise in a routine: raise the weight target by the exercise\'s increment (or an explicit weight_increment) and the rep target by the rep step (or an explicit reps_increment). For bodyweight exercises (weight 0) only reps move; for timed exercises the duration target rises by 5 s. Cardio exercises cannot be progressed this way — adjust min/speed via update_routine.',
+  schema: {
+    routine_id: z.string().min(1),
+    exercise_id: z.string().min(1),
+    weight_increment: z.number().positive().optional().describe('Explicit weight step. Defaults to the exercise\'s increment (5 kg lower body / 2.5 kg upper body in kg units).'),
+    reps_increment: z.number().int().positive().optional().describe('Explicit rep step. Defaults to the exercise\'s rep step (2 for unilateral work, else 1).')
+  },
+  handler: ({ routine_id, exercise_id, weight_increment, reps_increment }) => {
+    const S = getState()
+    if (!S) return noState()
+    const r = requireRoutine(S, routine_id)
+    const cfg = requireExercise(r, exercise_id)
+    const mode = modeOf({ ...cfg, id: cfg.id })
+    if (mode === 'cardio') {
+      const e = new Error('cardio exercises have no weight/reps to progress — adjust min/speed via update_routine')
+      e.code = 'EINVAL'
+      throw e
+    }
+    const unit = S.unit || 'kg'
+    if (weight_increment != null && weight_increment <= 0) {
+      const e = new Error('weight_increment must be a positive number')
+      e.code = 'EINVAL'
+      throw e
+    }
+    if (reps_increment != null && reps_increment <= 0) {
+      const e = new Error('reps_increment must be a positive integer')
+      e.code = 'EINVAL'
+      throw e
+    }
+    const wInc = weight_increment ?? (cfg.weight > 0 ? defaultIncrement(cfg.id, unit) : 0)
+    const rInc = reps_increment ?? repStepOf(cfg)
+    return writeState(st => {
+      const rr = requireRoutine(st, routine_id)
+      const cc = requireExercise(rr, exercise_id)
+      if (mode === 'time') {
+        cc.sec = (cc.sec || 0) + (weight_increment ?? DEFAULT_SEC_INCREMENT)
+      } else {
+        if (cc.weight > 0) cc.weight = snapWeight((cc.weight || 0) + wInc, wInc)
+        if (cc.reps != null) {
+          cc.reps = (cc.reps || 0) + rInc
+          if (cc.repsMin != null) cc.repsMin = (cc.repsMin || 0) + rInc
+        }
+      }
+      return st
+    }).then(() => {
+      const after = requireExercise(requireRoutine(getState(), routine_id), exercise_id)
+      return {
+        routine_id, exercise_id,
+        // weight 0 means bodyweight work — surface null so the LLM reads "no load", not "0 kg".
+        weight: after.weight > 0 ? after.weight : null,
+        reps: after.reps ?? null,
+        reps_min: after.repsMin ?? null,
+        sec: after.sec ?? null,
+        mode
+      }
+    })
+  }
+}
+
+/** swap_exercise — replace one exercise with another, keeping the target structure. */
+export const swapExercise = {
+  name: 'swap_exercise',
+  description: 'Replace one exercise in a routine with another from the catalog. The replacement keeps the original\'s sets/reps/weight/increment/superset structure — adjust targets afterwards with update_routine if the new exercise needs different numbers.',
+  schema: {
+    routine_id: z.string().min(1),
+    exercise_id: z.string().min(1).describe('The exercise to replace.'),
+    new_exercise_id: z.string().min(1).describe('The catalog exercise to put in its place.')
+  },
+  handler: ({ routine_id, exercise_id, new_exercise_id }) => {
+    const S = getState()
+    if (!S) return noState()
+    withCustomExercises(S)
+    assertKnownExercise(new_exercise_id)
+    const r = requireRoutine(S, routine_id)
+    requireExercise(r, exercise_id)
+    return writeState(st => {
+      const rr = requireRoutine(st, routine_id)
+      const cc = requireExercise(rr, exercise_id)
+      cc.id = new_exercise_id
+      return st
+    }).then(() => ({ routine_id, replaced: exercise_id, with: new_exercise_id }))
+  }
+}
+
+/** schedule_deload — scale a routine's load down and remember the original. */
+export const scheduleDeload = {
+  name: 'schedule_deload',
+  description: 'Apply a deload to a routine: scale every weighted exercise\'s target down by factor (default 0.6) and reduce set counts, so the week is genuinely easier. The original targets are snapshotted in the MCP metadata file; cancel_deload restores them. Only one active deload per routine.',
+  schema: {
+    routine_id: z.string().min(1),
+    factor: z.number().min(0.3).max(0.9).optional().describe('Load factor, e.g. 0.6 = 60% of normal weight. Defaults to 0.6.')
+  },
+  handler: ({ routine_id, factor }) => {
+    const S = getState()
+    if (!S) return noState()
+    const f = factor ?? 0.6
+    if (f < 0.3 || f > 0.9) {
+      const e = new Error('factor must be between 0.3 and 0.9')
+      e.code = 'EINVAL'
+      throw e
+    }
+    requireRoutine(S, routine_id)
+    return writeState(st => {
+      const rr = requireRoutine(st, routine_id)
+      const meta = readMeta()
+      if (meta.deloads[routine_id]) {
+        const e = new Error(`routine ${JSON.stringify(rr.name)} already has an active deload — cancel_deload first`)
+        e.code = 'EALREADY'
+        throw e
+      }
+      meta.deloads[routine_id] = {
+        originalEx: JSON.parse(JSON.stringify(rr.ex || [])),
+        factor: f,
+        scheduledAt: new Date().toISOString()
+      }
+      writeMeta(meta)
+      rr.ex = scaleExercises(rr.ex, f)
+      return st
+    }).then(() => ({ routine_id, factor: f, deloaded: true }))
+  }
+}
+
+/** cancel_deload — restore a routine's original targets from the snapshot. */
+export const cancelDeload = {
+  name: 'cancel_deload',
+  description: 'Cancel an active deload and restore the routine\'s original targets from the snapshot taken at schedule_deload. Reports a warning if the routine was modified while the deload was active (the snapshot is restored regardless).',
+  schema: { routine_id: z.string().min(1) },
+  handler: ({ routine_id }) => {
+    const S = getState()
+    if (!S) return noState()
+    const r = requireRoutine(S, routine_id)
+    const meta = readMeta()
+    const snap = meta.deloads[routine_id]
+    if (!snap) {
+      const e = new Error(`no active deload for routine ${JSON.stringify(r.name)}`)
+      e.code = 'ENOENT'
+      throw e
+    }
+    // Detect manual edits during the deload: compare the current exercises against the
+    // scaled snapshot. If they differ, the user changed something in the app meanwhile.
+    const scaled = scaleExercises(snap.originalEx, snap.factor)
+    const changed = JSON.stringify(r.ex || []) !== JSON.stringify(scaled)
+    return writeState(st => {
+      const rr = requireRoutine(st, routine_id)
+      rr.ex = JSON.parse(JSON.stringify(snap.originalEx))
+      return st
+    }).then(() => {
+      const m2 = readMeta()
+      delete m2.deloads[routine_id]
+      writeMeta(m2)
+      return {
+        routine_id,
+        restored: true,
+        warning: changed
+          ? 'routine was modified while the deload was active — original snapshot restored anyway; review the routine'
+          : null
+      }
+    })
+  }
+}
+
+/* ---------- workout-log write tools ---------- */
+
+function requireWorkout(S, workout_id) {
+  const w = (S.workouts || []).find(x => x.id === workout_id)
+  if (!w) { const e = new Error(`no workout with id ${JSON.stringify(workout_id)}`); e.code = 'ENOENT'; throw e }
+  return w
+}
+
+// Locate the entry for exercise_id inside a workout. Most sessions log one entry per
+// exercise; when the same exercise appears twice, entry_index (0-based position among the
+// matching entries) picks one. Without it, an ambiguous match is an error, not a guess.
+function requireEntry(w, exercise_id, entry_index) {
+  const matches = []
+  ;(w.entries || []).forEach((e, i) => { if (e.id === exercise_id) matches.push({ e, i }) })
+  if (!matches.length) {
+    const e = new Error(`workout ${JSON.stringify(w.id)} has no entry for exercise ${JSON.stringify(exOr(exercise_id).n)} (${exercise_id})`)
+    e.code = 'ENOENT'
+    throw e
+  }
+  if (entry_index != null) {
+    const m = matches[entry_index]
+    if (!m) { const err = new Error(`entry_index ${entry_index} out of range — ${matches.length} entr${matches.length === 1 ? 'y' : 'ies'} match exercise ${exercise_id}`); err.code = 'EINVAL'; throw err }
+    return m
+  }
+  if (matches.length > 1) {
+    const e = new Error(`exercise ${exercise_id} appears ${matches.length} times in this workout — pass entry_index (0-based, among the matching entries) to choose one`)
+    e.code = 'EINVAL'
+    throw e
+  }
+  return matches[0]
+}
+
+/** relabel_workout_exercise — point a mislabelled entry at the exercise actually performed. */
+export const relabelWorkoutExercise = {
+  name: 'relabel_workout_exercise',
+  description: 'Fix a mislabelled exercise in a finished workout: point one entry at another catalog exercise (e.g. "I did deadlifts but logged bent-over rows"). Moves the entry id, its saved target snapshot and the workout\'s PR list to the new exercise; weights, reps and set history stay as logged. PR flags are moved, not recomputed. If the same exercise appears more than once in the workout, pass entry_index.',
+  schema: {
+    workout_id: z.string().min(1).describe('The workout id from list_workouts.'),
+    exercise_id: z.string().min(1).describe('The exercise id that was logged wrongly.'),
+    new_exercise_id: z.string().min(1).describe('The catalog exercise id that was actually performed.'),
+    entry_index: z.number().int().min(0).optional().describe('If the wrong exercise appears multiple times in the workout: 0-based index among the matching entries.')
+  },
+  handler: ({ workout_id, exercise_id, new_exercise_id, entry_index }) => {
+    const S = getState()
+    if (!S) return noState()
+    requireWorkout(S, workout_id)
+    if (exercise_id === new_exercise_id) {
+      const e = new Error('exercise_id and new_exercise_id are identical — nothing to relabel')
+      e.code = 'EINVAL'
+      throw e
+    }
+    withCustomExercises(S)
+    assertKnownExercise(new_exercise_id)
+    return writeState(st => {
+      const w = requireWorkout(st, workout_id)
+      const { e } = requireEntry(w, exercise_id, entry_index)
+      e.id = new_exercise_id
+      // The target snapshot rides along so the workout view shows the new exercise's name;
+      // its sets/reps/weight stay as they were planned that day. Old seeds may have no target.
+      if (e.target && typeof e.target === 'object') e.target.id = new_exercise_id
+      if (Array.isArray(w.prs)) w.prs = [...new Set(w.prs.map(p => (p === exercise_id ? new_exercise_id : p)))]
+      return st
+    }).then(() => ({
+      workout_id,
+      relabeled: exercise_id,
+      with: new_exercise_id,
+      name: EXIDX[new_exercise_id]?.n || new_exercise_id
+    }))
+  }
+}
+
+/** update_workout_set — correct one logged set (weight/reps/duration/done). */
+export const updateWorkoutSet = {
+  name: 'update_workout_set',
+  description: 'Correct one logged set inside a finished workout — fix a mis-entered weight or rep count ("logged 16 kg, lifted 6 kg"), a duration, cardio speed, or the done flag. Recomputes the entry\'s top weight and the workout volume. The per-workout PR badge list is left untouched; the PR table derives from the raw sets and stays correct on its own.',
+  schema: {
+    workout_id: z.string().min(1).describe('The workout id from list_workouts.'),
+    exercise_id: z.string().min(1).describe('The exercise id whose set is being corrected.'),
+    set_index: z.number().int().min(0).describe('0-based index of the set within the entry (the order get_workout lists them).'),
+    entry_index: z.number().int().min(0).optional().describe('If the exercise appears multiple times in the workout: 0-based index among the matching entries.'),
+    w: z.number().min(0).optional().describe('New weight (0 = bodyweight/no load).'),
+    r: z.number().int().min(0).optional().describe('New rep count.'),
+    sec: z.number().min(0).optional().describe('New duration in seconds (timed exercises).'),
+    min: z.number().min(0).optional().describe('New duration in minutes (cardio).'),
+    speed: z.number().min(0).optional().describe('New speed (cardio).'),
+    done: z.boolean().optional().describe('Mark the set done or undone. Undone sets drop out of volume and strength estimates.')
+  },
+  handler: ({ workout_id, exercise_id, set_index, entry_index, w, r, sec, min, speed, done }) => {
+    const S = getState()
+    if (!S) return noState()
+    const fields = { w, r, sec, min, speed, done }
+    const mutable = Object.keys(fields).filter(k => fields[k] !== undefined)
+    if (!mutable.length) {
+      const e = new Error('nothing to change — pass at least one of w, r, sec, min, speed, done')
+      e.code = 'EINVAL'
+      throw e
+    }
+    requireWorkout(S, workout_id)
+    return writeState(st => {
+      const wr = requireWorkout(st, workout_id)
+      const { e: entry } = requireEntry(wr, exercise_id, entry_index)
+      const sets = entry.sets || []
+      const s = sets[set_index]
+      if (!s) {
+        const e = new Error(`set_index ${set_index} out of range — this entry has ${sets.length} set${sets.length === 1 ? '' : 's'}`)
+        e.code = 'EINVAL'
+        throw e
+      }
+      for (const k of mutable) s[k] = fields[k]
+      // topW mirrors the app: the weight of the last logged (done) set, null when none.
+      const lastDone = [...sets].reverse().find(x => x.done)
+      entry.topW = lastDone ? (lastDone.w || null) : null
+      wr.vol = workoutVolume(wr)
+      return st
+    }).then(() => {
+      const w2 = requireWorkout(getState(), workout_id)
+      const { e: entry2 } = requireEntry(w2, exercise_id, entry_index)
+      const s2 = entry2.sets[set_index]
+      return {
+        workout_id,
+        exercise_id,
+        set_index,
+        set: {
+          w: Number(s2.w) || 0,
+          r: Number(s2.r) || 0,
+          sec: Number(s2.sec) || 0,
+          min: Number(s2.min) || 0,
+          speed: Number(s2.speed) || 0,
+          done: !!s2.done
+        },
+        entry_top_w: entry2.topW ?? null,
+        workout_volume: w2.vol ?? workoutVolume(w2)
+      }
+    })
+  }
+}
+
+/** delete_workout — remove a finished session entirely. */
+export const deleteWorkout = {
+  name: 'delete_workout',
+  description: 'Delete a finished workout entirely (e.g. a session accidentally logged twice). Irreversible from the MCP side — the pre-write backup in the MCP metadata file is the only recovery path. Identify the session by workout_id from list_workouts; there is deliberately no date-only variant, because two sessions can share one date.',
+  schema: {
+    workout_id: z.string().min(1).describe('The workout id from list_workouts.')
+  },
+  handler: ({ workout_id }) => {
+    const S = getState()
+    if (!S) return noState()
+    const w = requireWorkout(S, workout_id)
+    const summary = { date: w.d, name: w.name || null, volume: workoutVolume(w) }
+    return writeState(st => {
+      st.workouts = (st.workouts || []).filter(x => x.id !== workout_id)
+      return st
+    }).then(() => ({ deleted: workout_id, ...summary }))
+  }
+}
+
+/* ---------- equipment-profile tools ---------- */
+
+// The equipment values the catalog actually contains — the same list the app's profile
+// editor offers (ALL_EQUIPMENT in lib/equipment.js). Validating against it keeps a typo
+// like "leverage machnie" from silently matching zero exercises.
+function catalogEquipment() {
+  const counts = {}
+  for (const ex of EXDB) if (ex.eq) counts[ex.eq] = (counts[ex.eq] || 0) + 1
+  return Object.entries(counts)
+    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
+    .map(([k, n]) => ({ equipment: k, exercise_count: n }))
+}
+
+function normalizeEquipmentList(list) {
+  const valid = new Set(EXDB.map(e => e.eq).filter(Boolean))
+  const out = []
+  for (const raw of list || []) {
+    const k = String(raw).trim()
+    if (!k) continue
+    if (!valid.has(k)) {
+      const e = new Error(`unknown equipment type ${JSON.stringify(raw)} — must be one of the catalog values (see get_equipment)`)
+      e.code = 'EINVAL'
+      throw e
+    }
+    if (!out.includes(k)) out.push(k)
+  }
+  return out
+}
+
+/** get_equipment — current profiles + the catalog's equipment checklist. */
+export const getEquipment = {
+  name: 'get_equipment',
+  description: 'Show the user\'s equipment profiles (named "Home"/"Gym"/… lists of equipment types), which one is active, and whether filtering is on. Also returns the full checklist of equipment types the exercise catalog contains, with exercise counts — use it to pick valid type names for update_equipment_profiles. Body-weight exercises are always available in every profile and never listed here.',
+  schema: {},
+  handler: () => {
+    const S = getState()
+    if (!S) return noState()
+    return {
+      filter_on: !!S.equipFilterOn,
+      active_profile_id: S.activeEquipId || null,
+      profiles: (S.equipProfiles || []).map(p => ({
+        id: p.id,
+        name: p.name,
+        equipment: p.equipment || [],
+        equipment_count: (p.equipment || []).length
+      })),
+      catalog_equipment: catalogEquipment()
+    }
+  }
+}
+
+const profileSchema = z.object({
+  name: z.string().min(1).max(40).describe('Profile name, e.g. "Home Gym".'),
+  equipment: z.array(z.string()).min(1).describe('Equipment type names exactly as the catalog spells them (see get_equipment → catalog_equipment), e.g. ["dumbbell", "barbell", "leverage machine"].'),
+  id: z.string().optional().describe('Keep an existing profile\'s id to update it in place; omit for a new profile (one is generated).')
+})
+
+/** update_equipment_profiles — replace the whole profile list + filter settings. */
+export const updateEquipmentProfiles = {
+  name: 'update_equipment_profiles',
+  description: 'Replace the user\'s equipment profiles wholesale — the same replace semantics as update_routine: profiles not listed are removed, so pass the complete desired list. Also sets which profile is active and whether the filter is on. The active filter hides library/picker exercises that need equipment missing from the active profile (body-weight exercises are never hidden). Use get_equipment first for valid equipment type names.',
+  schema: {
+    profiles: z.array(profileSchema).describe('The complete desired profile list.'),
+    active_profile_id: z.string().nullable().optional().describe('Which profile is active. Must be one of the listed ids (or null = no active profile).'),
+    filter_on: z.boolean().optional().describe('Turn the equipment filter on/off. Filtering without an active profile changes nothing — both switches matter.')
+  },
+  handler: ({ profiles, active_profile_id, filter_on }) => {
+    const S = getState()
+    if (!S) return noState()
+    if (!profiles || !profiles.length) {
+      const e = new Error('profiles must contain at least one profile — pass an empty equipment list per profile instead of deleting everything (or delete profiles in the app)')
+      e.code = 'EINVAL'
+      throw e
+    }
+    // Validate everything up front so a bad type never half-applies.
+    const cleaned = profiles.map(p => ({ ...p, equipment: normalizeEquipmentList(p.equipment) }))
+    const ids = cleaned.map(p => typeof p.id === 'string' && p.id ? p.id : null)
+    if (active_profile_id && !ids.includes(active_profile_id)) {
+      const e = new Error(`active_profile_id ${JSON.stringify(active_profile_id)} is not one of the listed profile ids`)
+      e.code = 'EINVAL'
+      throw e
+    }
+    const names = cleaned.map(p => p.name)
+    if (new Set(names).size !== names.length) {
+      const e = new Error('profile names must be unique')
+      e.code = 'EINVAL'
+      throw e
+    }
+    return writeState(st => {
+      const next = cleaned.map((p, i) => ({
+        id: ids[i] || 'eq' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+        name: p.name,
+        equipment: p.equipment
+      }))
+      st.equipProfiles = next
+      if (active_profile_id !== undefined) st.activeEquipId = active_profile_id
+      if (filter_on !== undefined) st.equipFilterOn = filter_on
+      // A deleted profile must not stay active — the app resolves activeEquipId against this
+      // list and a dangling id means the filter silently stops matching anything.
+      if (st.activeEquipId && !next.some(p => p.id === st.activeEquipId)) st.activeEquipId = null
+      return st
+    }).then(() => ({
+      filter_on: filter_on ?? !!getState().equipFilterOn,
+      active_profile_id: active_profile_id !== undefined ? active_profile_id : (getState().activeEquipId || null),
+      profiles: getState().equipProfiles.map(p => ({ id: p.id, name: p.name, equipment: p.equipment, equipment_count: p.equipment.length }))
+    }))
+  }
+}
+
+
 /* ---------- registration list ---------- */
 
 export const TOOLS = [
-  listRoutines, getRoutine, previewSession, getWeekPlan, listWorkouts, getWorkout, getBodyweight, estimate1rm, muscleBalance
+  listRoutines, getRoutine, previewSession, getWeekPlan, listWorkouts, getWorkout, getBodyweight, estimate1rm, muscleBalance,
+  createRoutine, updateRoutine, deleteRoutine, progressExercise, swapExercise, scheduleDeload, cancelDeload,
+  relabelWorkoutExercise, updateWorkoutSet, deleteWorkout, getEquipment, updateEquipmentProfiles
 ]
 
 function noState() {

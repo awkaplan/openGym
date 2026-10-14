@@ -1,8 +1,15 @@
-/* opengym-mcp state — reads ./data/state-<uid>.json + db.json (read-only). Cached with an
-   fs.watch + mtime fallback so a session the api server just wrote is visible on the next
-   tool call without a restart. */
+/* opengym-mcp state — reads ./data/state-<uid>.json + db.json (read-only), and writes plan
+   changes back to the same state file (atomic temp+rename, same pattern as the openGym api).
+   MCP-owned metadata (deload snapshots, pre-write backups) lives in a separate
+   state-<uid>.mcp.json the app never touches, so an app write cannot wipe it.
+   Cached with an fs.watch + mtime fallback so a session the api server just wrote is
+   visible on the next tool call without a restart. */
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+// The server's own stamping of a write from a client that does not stamp its edits (what an
+// API planner is). Same module PUT /api/data runs, so an MCP write is recorded the same way.
+import { stampPut } from '../../api/sync-stamps.js'
 
 const DATA_DIR = process.env.OPENGYM_DATA || path.join(process.cwd(), 'data')
 
@@ -12,6 +19,14 @@ let _db = undefined
 let _uid = null
 let _watcher = null
 let _loadedMtime = 0    // mtimeMs we last read at — used to catch watcher omissions
+
+// Write support. _testMode: seeded tests mutate in-memory state only — no disk I/O, no
+// metadata file — so the suite stays fast and isolated. _writeQueue serialises concurrent
+// async handlers (Node is single-threaded, but two tool calls can interleave at await points).
+let _testMode = false
+let _writeQueue = Promise.resolve()
+const WID_KEEP = 50   // same as api/server.js
+let _meta = undefined   // cached metadata object ({ deloads, backups })
 
 // null means one thing only: the file is not there (an account that never synced from a device).
 // Every other failure — no permission on the mount, a truncated or corrupt file — is a real fault,
@@ -147,12 +162,110 @@ export const dataDir = () => DATA_DIR
 
 // Test-only: work against a passed-in state, not the disk.
 export function _seedStateForTests(state) {
+  _testMode = true
   _uid = 'test-uid'
   _db = { users: [{ id: _uid, name: 'Test', created: '2026-07-26T00:00:00.000Z' }], creds: [], subs: [], invites: [] }
   _state = state
+  _meta = { deloads: {}, backups: [] }
   _loadedMtime = Number.MAX_SAFE_INTEGER   // never re-read from disk in a test
   if (_watcher) { _watcher.close(); _watcher = null }
 }
+
+/* ---------- write support ---------- */
+
+function metaFile() {
+  return path.join(DATA_DIR, 'state-' + _uid + '.mcp.json')
+}
+
+// Atomic write: temp file + rename, the same pattern the openGym api uses for PUT /api/data.
+// A reader (the app, another MCP process) never sees a half-written file.
+function atomicWrite(file, data) {
+  const tmp = file + '.tmp-' + process.pid + '-' + Date.now()
+  fs.writeFileSync(tmp, data, 'utf8')
+  fs.renameSync(tmp, file)
+}
+
+// MCP-owned metadata: deload snapshots + pre-write backups. Lives in its own file because the
+// app replaces the whole state file on write — an extra field there would be lost.
+function readMeta() {
+  if (_meta) return _meta
+  const m = readJsonOrNull(metaFile())
+  _meta = { deloads: m?.deloads || {}, backups: Array.isArray(m?.backups) ? m.backups : [] }
+  return _meta
+}
+
+function writeMeta(meta) {
+  _meta = meta
+  if (_testMode) return
+  atomicWrite(metaFile(), JSON.stringify(meta))
+}
+
+// Run a state mutation under the write queue. The mutator receives a fresh deep clone of the
+// latest state (re-read if the file changed since our last load) and returns the next state.
+// Before persisting, the current state is backed up (last 5) into the metadata file so a
+// destructive write is rollback-able. Resolves with the persisted state.
+export function writeState(mutator) {
+  const run = _writeQueue.then(() => {
+    const S = getState()
+    if (!S) {
+      const e = new Error('no synced state yet — sign in at least once from a device so the openGym api can save a state file for this profile')
+      e.code = 'ENOSTATE'
+      throw e
+    }
+    // `cur` is the document as the api has it on disk, read fresh (not the cached, defaults-
+    // merged S): the revision and the stamps are compared against exactly what the api holds.
+    // Reading and renaming below happen with nothing awaited between them, which is the same
+    // window PUT /api/data has against another writer.
+    const cur = _testMode ? S : (readJsonOrNull(stateFile(_uid)) || S)
+    const next = mutator(structuredClone(_testMode ? S : Object.assign({}, defaultsShape(), cur)))
+    next._ts = Date.now()
+    // Do what PUT /api/data does with a write from a client that does not stamp (v1.4):
+    //  - stampPut records what this write removed or changed (`deleted` / `edited`), so another
+    //    device that still holds a deleted routine or workout does not bring it back on its
+    //    next merge;
+    //  - `_rev` moves, so a client polling /api/data/rev reads the change instead of pushing its
+    //    own older copy over it (its push would carry the old baseRev and be accepted);
+    //  - `_wid` / `_wids` name this write and its ancestors for the same reason.
+    const report = {}
+    stampPut(cur, next, { overRead: true, stamped: false, report })
+    const curRev = cur._rev || 0
+    next._rev = report.changed ? curRev + 2 : curRev + 1
+    next._wids = [...(Array.isArray(cur._wids) ? cur._wids : []), ...(cur._wid ? [cur._wid] : [])]
+      .filter(x => typeof x === 'string').slice(-WID_KEEP)
+    next._wid = crypto.randomBytes(8).toString('hex')
+    if (!_testMode) {
+      const meta = readMeta()
+      meta.backups.push({ at: new Date().toISOString(), state: cur })
+      if (meta.backups.length > 5) meta.backups = meta.backups.slice(-5)
+      writeMeta(meta)
+      atomicWrite(stateFile(_uid), JSON.stringify(next))
+      _state = Object.assign({}, defaultsShape(), next)
+      try { _loadedMtime = fs.statSync(stateFile(_uid)).mtimeMs } catch {}
+    } else {
+      _state = next
+    }
+    return next
+  })
+  // A failed write must not poison the queue for the next caller.
+  _writeQueue = run.catch(() => {})
+  return run
+}
+
+// Run a metadata mutation under the same queue (serialised with state writes). Resolves with
+// the updated metadata object.
+export function updateMeta(mutator) {
+  const run = _writeQueue.then(() => {
+    const meta = readMeta()
+    const next = mutator(meta)
+    writeMeta(next)
+    return next
+  })
+  _writeQueue = run.catch(() => {})
+  return run
+}
+
+export const _metaForTests = () => readMeta()
+export { readMeta, writeMeta }
 
 function defaultsShape() {
   return {
