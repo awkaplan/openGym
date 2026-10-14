@@ -59,4 +59,13 @@ describe('writeState against a real state file', () => {
     expect(d._rev).toBeGreaterThan(before)
     expect(d._wids).toHaveLength(3)
   })
+
+  test('clearing a weekday through set_week_plan is on record, so another device does not put it back', async () => {
+    await load()
+    const { TOOLS } = await import('../src/tools.js')
+    await TOOLS.find(t => t.name === 'set_week_plan').handler({ days: [{ weekday: 3, routine_ids: [] }] })
+    const d = onDisk()
+    expect(d.week).toEqual({})
+    expect(Object.keys(d.edited || {})).toContain('week.3')
+  })
 })

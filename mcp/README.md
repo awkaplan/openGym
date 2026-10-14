@@ -106,6 +106,38 @@ v1.2.x) onto v1.4.1:
 `schedule_deload`, `cancel_deload`, `relabel_workout_exercise`, `update_workout_set`,
 `delete_workout`, `get_equipment`, `update_equipment_profiles`.
 
+`create_routine` / `update_routine` also take per-set targets (`pyramid`, `pyramid_weight`,
+`pyramid_rest_sec`, the names `get_routine` returns), saved the way the routine editor saves them.
+
+Four more write the week plan, read back by `get_week_plan` (which also lists every per-date
+override from today on, under `overrides`):
+
+- `set_week_plan` — routines per weekday (`S.week`); only the listed weekdays change, or the whole
+  week with `replace: true`. An empty list is a rest day.
+- `clear_week_plan` — every weekday a rest day; `include_overrides` also drops today's and later
+  per-date overrides (past ones are the record of that day and are always kept).
+- `set_day_override` / `clear_day_override` — one date trains a given routine or rests
+  (`S.dayPlan`), or goes back to its weekday. Picking a coach-week session pins it, as the app does.
+
+Six more create and edit finished workouts; with `get_workout`, `list_workouts`,
+`update_workout_set` and `delete_workout` that is the whole record:
+
+- `create_workout` — log a finished workout (date, start time, duration, exercises and sets), as
+  the app's "Log a past workout" does: filed in date order, PR badges against the sessions before
+  it, never moving progression or the confirmed working weights. `routine_id` makes it count for
+  that routine (and a rotation pass).
+- `update_workout` — date, start time, duration, name, session note.
+- `add_workout_exercise` / `remove_workout_exercise`, `add_workout_set` / `remove_workout_set`.
+
+Every edit of a saved workout (these, and `update_workout_set`) goes through the app's own history
+editor (`frontend/src/lib/session-edit.js`): volume, top weights, the sync stamp and the PR badges
+come out as the same edit in the app would leave them, and a change that would leave the workout
+with no completed set is refused in favour of `delete_workout`. `get_workout` also returns the
+start time, duration in minutes and session note, so these read back.
+
+None of the week-plan tools switches between a fixed week and a rotation: while a rotation or coach week is live,
+the write answers with a `note` saying its sessions come first.
+
 Writes go straight to `state-<uid>.json`, so the data directory must be mounted read-write.
 Changes from the original, needed for v1.4's sync protocol:
 

@@ -21,6 +21,13 @@ import {
 import { loadOfWorkouts, rankOf, levelsOf } from '../../frontend/src/lib/muscles.js'
 import { policyFor, defaultIncrement, DEFAULT_SEC_INCREMENT, snapWeight } from '../../frontend/src/lib/progression.js'
 import { deleteRoutine as deleteRoutineInState } from '../../frontend/src/lib/routines.js'
+import { scheduleModeOf, refillIfComplete } from '../../frontend/src/lib/rotation.js'
+import { buildCompletedWorkout } from '../../frontend/src/lib/finish-workout.js'
+import { editCompletedSession, saveWorkoutEdit } from '../../frontend/src/lib/session-edit.js'
+import { backfillStart, insertChronological } from '../../frontend/src/lib/backfill.js'
+import { moveWorkout, setWorkoutDuration, rebuildPrHistory, startTimeOf, endsInFuture, durationMinOf, MAX_DURATION_MIN } from '../../frontend/src/lib/workout-date.js'
+import { stampWorkout } from '../../frontend/src/lib/sync-merge.js'
+import { normalizePyramid, normalizePyramidRest, normalizePyramidWeight, flatFromPyramid, PYRAMID_MAX, MAX_PYRAMID_SETS } from '../../frontend/src/lib/pyramid.js'
 import { buildSessionEntries, startsFromLast } from '../../frontend/src/lib/session-start.js'
 
 /* ---------- helpers ---------- */
@@ -194,7 +201,7 @@ export const getRoutine = {
 const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
 export const getWeekPlan = {
   name: 'get_week_plan',
-  description: 'Show the user\'s training plan. `days` is the authoritative answer to "what is planned when": the next seven dates from today with the routines planned for each (a date can hold several — a combined day) and how each was decided: a coach-week session ("coach"), a session the user pinned to that date ("pinned"), a one-off routine override ("override"), a "rest" override ("rest_override"), the weekday plan ("weekday") or nothing ("rest"). `coach_week` is the current coach week when one is running (a week written by an external planner through the API, never by the app): its sessions are done IN ORDER on whatever days the user trains (no weekday attached), the first undone one is today\'s session, a session can be pinned to a date, and `waiting` means the week starts on `starts_on`. `weekdays` is the user\'s own weekly plan keyed by JS getDay() (Sunday=0 … Saturday=6, the openGym state convention) — in a coach week it holds only the routines the user planned themselves, which ride along beside the coach-week session.',
+  description: 'Show the user\'s training plan. `days` is the authoritative answer to "what is planned when": the next seven dates from today with the routines planned for each (a date can hold several — a combined day) and how each was decided: a coach-week session ("coach"), a session the user pinned to that date ("pinned"), a one-off routine override ("override"), a "rest" override ("rest_override"), the weekday plan ("weekday") or nothing ("rest"). `overrides` lists every per-date override from today on (set_day_override / clear_day_override change them). `coach_week` is the current coach week when one is running (a week written by an external planner through the API, never by the app): its sessions are done IN ORDER on whatever days the user trains (no weekday attached), the first undone one is today\'s session, a session can be pinned to a date, and `waiting` means the week starts on `starts_on`. `weekdays` is the user\'s own weekly plan keyed by JS getDay() (Sunday=0 … Saturday=6, the openGym state convention) — in a coach week it holds only the routines the user planned themselves, which ride along beside the coach-week session.',
   schema: {},
   handler: () => {
     const S = getState()
@@ -239,6 +246,17 @@ export const getWeekPlan = {
         sessions: view.items.map(i => ({ routine_id: i.id, routine_name: i.name, state: i.state, pinned_to: i.on ?? null }))
       } : null,
       days,
+      // Every per-date override from today on, so one past the seven `days` can be read back
+      // (and cleared). Past ones stay in the state as the record of a missed or moved day.
+      overrides: Object.keys(S.dayPlan || {}).filter(iso => iso >= isoToday).sort().map(iso => {
+        const ov = S.dayPlan[iso]
+        return {
+          date: iso,
+          kind: ov === 'rest' ? 'rest' : pinState(S, ov) ? 'coach_pin' : 'routine',
+          routine_id: ov === 'rest' ? null : ov,
+          routine_name: ov === 'rest' ? null : nameOf(ov)
+        }
+      }),
       weekdays: [0, 1, 2, 3, 4, 5, 6].map(d => {
         const ids = weekdayIds(d)
         // Surface today's override only (not the whole dayPlan dict — usually empty, but might
@@ -370,6 +388,9 @@ export const getWorkout = {
       sets_done: setsDone(w),
       sets_planned: plannedSets(w),
       duration: w.end && w.start ? friendlyDuration(w.end - w.start) : null,
+      start_time: Number.isFinite(w.start) ? startTimeOf(w) : null,
+      duration_min: Number.isFinite(w.start) ? durationMinOf(w) : null,
+      note: w.note || null,
       prs: (w.prs || []).map(id => {
         const ex = exerciseOf(id, S)
         return ex.missing ? id : ex.n
@@ -731,15 +752,53 @@ const exerciseSchema = z.object({
   policy: z.enum(POLICY_ENUM).optional(),
   sec: z.number().positive().optional(),
   min: z.number().positive().optional(),
-  speed: z.number().positive().optional()
+  speed: z.number().positive().optional(),
+  // Per-set targets — the app's pyramid sets, under the names get_routine returns them, so a
+  // routine read back can be written back as it is.
+  pyramid: z.array(z.union([z.number().int().min(1), z.literal(PYRAMID_MAX)])).min(1).max(MAX_PYRAMID_SETS).optional()
+    .describe(`Per-set rep targets, one per set in order (e.g. [10, 8, 6]); "${PYRAMID_MAX}" is as many reps as possible. Replaces sets/reps (reps mode only). Pyramid exercises are never auto-progressed.`),
+  pyramid_weight: z.array(z.number().min(0)).max(MAX_PYRAMID_SETS).optional()
+    .describe('Planned weight per set, aligned with pyramid (e.g. [60, 70, 80]). 0 means that set starts from what it lifted last time. Needs pyramid.'),
+  pyramid_rest_sec: z.array(z.number().int().min(0)).max(MAX_PYRAMID_SETS).optional()
+    .describe('Rest in seconds after each set, aligned with pyramid. 0 means the exercise\'s rest. Needs pyramid.')
 })
+
+function invalid(message) {
+  const e = new Error(message)
+  e.code = 'EINVAL'
+  return e
+}
+
+// One write-tool exercise as the routine stores it. Per-set targets are saved the way the
+// routine editor saves them: the list is the prescription, and sets/reps follow it so every
+// reader of the flat target still makes sense; an all-zero weight or rest list is no field.
+function routineExercise({ pyramid, pyramid_weight, pyramid_rest_sec, ...e }) {
+  const cfg = { ...e }
+  if (!pyramid) {
+    if (pyramid_weight || pyramid_rest_sec) throw invalid(`exercise ${JSON.stringify(e.id)}: pyramid_weight and pyramid_rest_sec need a pyramid`)
+    return cfg
+  }
+  if (modeOf(cfg) !== 'reps') throw invalid(`exercise ${JSON.stringify(e.id)}: per-set targets (pyramid) are for reps mode only`)
+  for (const [name, list] of [['pyramid_weight', pyramid_weight], ['pyramid_rest_sec', pyramid_rest_sec]]) {
+    if (list && list.length !== pyramid.length) throw invalid(`exercise ${JSON.stringify(e.id)}: ${name} has ${list.length} entries, pyramid has ${pyramid.length}`)
+  }
+  const list = normalizePyramid(pyramid)
+  Object.assign(cfg, { mode: 'reps' }, flatFromPyramid(list), { pyramid: list })
+  delete cfg.repsMin
+  delete cfg.repsMax
+  const rest = normalizePyramidRest(pyramid_rest_sec, list.length)
+  if (rest.length) cfg.pyramidRest = rest
+  const weight = normalizePyramidWeight(pyramid_weight, list.length)
+  if (weight.length) cfg.pyramidWeight = weight
+  return cfg
+}
 
 /* ---------- the 7 write tools ---------- */
 
 /** create_routine — a new routine with its exercise list. */
 export const createRoutine = {
   name: 'create_routine',
-  description: 'Create a new workout routine with a name and a list of exercises, each with set/rep/weight targets (and optional increment, superset group, or per-exercise progression policy). Exercise ids must come from the catalog (get_routine/list_routines return them). Persists directly into the openGym state.',
+  description: 'Create a new workout routine with a name and a list of exercises, each with set/rep/weight targets (and optional increment, superset group, per-exercise progression policy, or per-set rep/weight/rest steps via pyramid). Exercise ids must come from the catalog (get_routine/list_routines return them). Persists directly into the openGym state.',
   schema: {
     name: z.string().min(1).describe('Routine name, e.g. "Push Day".'),
     emoji: z.string().optional().describe('Optional emoji shown next to the routine name.'),
@@ -758,9 +817,10 @@ export const createRoutine = {
     }
     withCustomExercises(S)
     exercises.forEach(e => assertKnownExercise(e.id))
+    const ex = exercises.map(routineExercise)
     const id = crypto.randomUUID()
     return writeState(st => {
-      st.routines = [...(st.routines || []), { id, name, emoji: emoji || null, ...(prog ? { prog } : {}), ex: exercises.map(e => ({ ...e })) }]
+      st.routines = [...(st.routines || []), { id, name, emoji: emoji || null, ...(prog ? { prog } : {}), ex }]
       return st
     }).then(() => ({ id, name, exercise_count: exercises.length }))
   }
@@ -769,7 +829,7 @@ export const createRoutine = {
 /** update_routine — replace the structure of an existing routine. */
 export const updateRoutine = {
   name: 'update_routine',
-  description: 'Replace the structure of an existing routine: name, emoji, default policy, and/or the full exercise list. Exercises not listed are removed — pass the complete desired exercise list. Use routine_id from list_routines.',
+  description: 'Replace the structure of an existing routine: name, emoji, default policy, and/or the full exercise list. Exercises not listed are removed — pass the complete desired exercise list, including any pyramid / pyramid_weight / pyramid_rest_sec get_routine returned, or those per-set targets are dropped. Use routine_id from list_routines.',
   schema: {
     routine_id: z.string().min(1),
     name: z.string().min(1).optional(),
@@ -781,16 +841,18 @@ export const updateRoutine = {
     const S = getState()
     if (!S) return noState()
     requireRoutine(S, routine_id)
+    let ex = null
     if (exercises) {
       withCustomExercises(S)
       exercises.forEach(e => assertKnownExercise(e.id))
+      ex = exercises.map(routineExercise)
     }
     return writeState(st => {
       const r = requireRoutine(st, routine_id)
       if (name != null) r.name = name
       if (emoji !== undefined) r.emoji = emoji
       if (prog !== undefined) r.prog = prog || undefined
-      if (exercises) r.ex = exercises.map(e => ({ ...e }))
+      if (ex) r.ex = ex
       return st
     }).then(() => ({ routine_id, name: name ?? requireRoutine(S, routine_id).name, exercise_count: exercises ? exercises.length : undefined }))
   }
@@ -812,6 +874,128 @@ export const deleteRoutine = {
       deleteRoutineInState(st, routine_id)
       return st
     }).then(() => ({ deleted: routine_id }))
+  }
+}
+
+/* ---------- week plan ---------- */
+
+const WEEKDAY_NAMES = DAY_NAMES.map(n => n.toLowerCase())
+const weekdaySchema = z.union([z.number().int().min(0).max(6), z.string().min(1)])
+  .describe('JS getDay() index (Sunday=0 … Saturday=6, as get_week_plan returns it) or the English day name, e.g. "monday".')
+
+function weekdayOf(v) {
+  if (typeof v === 'number') return v
+  const i = WEEKDAY_NAMES.indexOf(v.trim().toLowerCase())
+  if (i < 0) throw invalid(`unknown weekday ${JSON.stringify(v)} — use 0-6 (Sunday=0) or a day name`)
+  return i
+}
+
+// What the week-plan writes answer with: the plan as get_week_plan reads it after the write,
+// plus a word when the app is not showing the weekday grid (a rotation or a coach week is live,
+// whose sessions come first and hide the weekday routines that are in it).
+function planAfterWrite(extra) {
+  const S = getState()
+  const out = { ...extra, ...getWeekPlan.handler() }
+  if (scheduleModeOf(S) === 'rotation') {
+    out.note = 'a rotation or coach week is in charge of the schedule: its sessions come first, and the weekday plan rides along beside them (the app shows the weekday grid again once it ends)'
+  }
+  return out
+}
+
+/** set_week_plan — put routines on weekdays (create / update the weekly plan). */
+export const setWeekPlan = {
+  name: 'set_week_plan',
+  description: 'Set the weekly plan: which routines are trained on which weekday. Each listed weekday gets exactly `routine_ids`, in the order the session runs them (two or more make a combined day); an empty list makes it a rest day. Weekdays not listed are left as they are, unless `replace` is true, which makes them rest days — use that to write a whole new week. One-off changes to a single date belong in set_day_override instead. Returns the plan as get_week_plan reads it.',
+  schema: {
+    days: z.array(z.object({
+      weekday: weekdaySchema,
+      routine_ids: z.array(z.string().min(1)).describe('Routine ids from list_routines; [] for a rest day.')
+    })).min(1),
+    replace: z.boolean().optional().describe('true: every weekday not in `days` becomes a rest day.')
+  },
+  handler: ({ days, replace }) => {
+    const S = getState()
+    if (!S) return noState()
+    const plan = new Map()
+    for (const { weekday, routine_ids } of days) {
+      const d = weekdayOf(weekday)
+      if (plan.has(d)) throw invalid(`${DAY_NAMES[d]} is listed twice`)
+      routine_ids.forEach(id => requireRoutine(S, id))
+      plan.set(d, [...new Set(routine_ids)])
+    }
+    return writeState(st => {
+      // A weekday never stores [] — the key goes instead, as the app's day sheet does.
+      st.week = replace ? {} : { ...(st.week || {}) }
+      for (const [d, ids] of plan) {
+        if (ids.length) st.week[d] = ids
+        else delete st.week[d]
+      }
+      return st
+    }).then(() => planAfterWrite({ updated_weekdays: [...plan.keys()].map(d => DAY_NAMES[d]) }))
+  }
+}
+
+/** clear_week_plan — every weekday a rest day (delete the weekly plan). */
+export const clearWeekPlan = {
+  name: 'clear_week_plan',
+  description: 'Delete the weekly plan: every weekday becomes a rest day. Routines themselves are kept. With `include_overrides`, every per-date override from today on goes too (one-off routines, rest days and coach-week sessions pinned to a date); past ones are always kept, as the record of what that day was. Returns the plan as get_week_plan reads it.',
+  schema: {
+    include_overrides: z.boolean().optional().describe('Also remove per-date overrides dated today or later.')
+  },
+  handler: ({ include_overrides } = {}) => {
+    const S = getState()
+    if (!S) return noState()
+    const today = todayIso()
+    const dropped = include_overrides ? Object.keys(S.dayPlan || {}).filter(iso => iso >= today) : []
+    return writeState(st => {
+      st.week = {}
+      if (dropped.length) {
+        st.dayPlan = { ...(st.dayPlan || {}) }
+        dropped.forEach(iso => { delete st.dayPlan[iso] })
+      }
+      return st
+    }).then(() => planAfterWrite({ cleared_weekdays: true, cleared_overrides: dropped.sort() }))
+  }
+}
+
+/** set_day_override — one date trains a given routine, or rests, whatever its weekday says. */
+export const setDayOverride = {
+  name: 'set_day_override',
+  description: 'Override one date: train `routine_id` on it, or make it a rest day with `rest: true`, in place of what its weekday plan says. Pass exactly one of the two. A date takes one routine (it replaces a combined weekday on that date). Picking a coach-week session that is still to do pins it to that date, as the app does. Replaces any override already on the date; clear_day_override puts the date back on the weekly plan. Returns the plan as get_week_plan reads it.',
+  schema: {
+    date: isoDate().describe('YYYY-MM-DD'),
+    routine_id: z.string().min(1).optional(),
+    rest: z.boolean().optional()
+  },
+  handler: ({ date, routine_id, rest }) => {
+    const S = getState()
+    if (!S) return noState()
+    if ((routine_id != null) === (rest === true)) throw invalid('pass exactly one of routine_id or rest: true')
+    if (routine_id != null) requireRoutine(S, routine_id)
+    const value = rest ? 'rest' : routine_id
+    const previous = S.dayPlan?.[date] ?? null
+    return writeState(st => {
+      st.dayPlan = { ...(st.dayPlan || {}), [date]: value }
+      return st
+    }).then(() => planAfterWrite({ date, override: value, previous_override: previous }))
+  }
+}
+
+/** clear_day_override — a date goes back to its weekday plan. */
+export const clearDayOverride = {
+  name: 'clear_day_override',
+  description: 'Remove the override on one date, so it follows the weekly plan again (for a coach-week session pinned there, it unpins it). `cleared` is false when the date had no override. Returns the plan as get_week_plan reads it.',
+  schema: { date: isoDate().describe('YYYY-MM-DD') },
+  handler: ({ date }) => {
+    const S = getState()
+    if (!S) return noState()
+    const previous = S.dayPlan?.[date]
+    if (previous === undefined) return planAfterWrite({ date, cleared: false })
+    return writeState(st => {
+      st.dayPlan = { ...(st.dayPlan || {}) }
+      delete st.dayPlan[date]
+      return st
+    }).then(() => planAfterWrite({ date, cleared: true, previous_override: previous }))
   }
 }
 
@@ -1053,7 +1237,7 @@ export const relabelWorkoutExercise = {
 /** update_workout_set — correct one logged set (weight/reps/duration/done). */
 export const updateWorkoutSet = {
   name: 'update_workout_set',
-  description: 'Correct one logged set inside a finished workout — fix a mis-entered weight or rep count ("logged 16 kg, lifted 6 kg"), a duration, cardio speed, or the done flag. Recomputes the entry\'s top weight and the workout volume. The per-workout PR badge list is left untouched; the PR table derives from the raw sets and stays correct on its own.',
+  description: 'Correct one logged set inside a finished workout — fix a mis-entered weight or rep count ("logged 16 kg, lifted 6 kg"), a duration, cardio speed, or the done flag. Recomputes the entry\'s top weight, the workout volume and the PR badges, as the app\'s workout editor does. Marking the workout\'s last completed set undone is refused — use delete_workout.',
   schema: {
     workout_id: z.string().min(1).describe('The workout id from list_workouts.'),
     exercise_id: z.string().min(1).describe('The exercise id whose set is being corrected.'),
@@ -1078,20 +1262,14 @@ export const updateWorkoutSet = {
     }
     requireWorkout(S, workout_id)
     return writeState(st => {
-      const wr = requireWorkout(st, workout_id)
-      const { e: entry } = requireEntry(wr, exercise_id, entry_index)
-      const sets = entry.sets || []
-      const s = sets[set_index]
-      if (!s) {
-        const e = new Error(`set_index ${set_index} out of range — this entry has ${sets.length} set${sets.length === 1 ? '' : 's'}`)
-        e.code = 'EINVAL'
-        throw e
-      }
-      for (const k of mutable) s[k] = fields[k]
-      // topW mirrors the app: the weight of the last logged (done) set, null when none.
-      const lastDone = [...sets].reverse().find(x => x.done)
-      entry.topW = lastDone ? (lastDone.w || null) : null
-      wr.vol = workoutVolume(wr)
+      // Through the app's history editor, like every other workout edit (editSavedWorkout): the
+      // top weight, volume, sync stamp and PR badges follow the corrected set.
+      editSavedWorkout(st, workout_id, draft => {
+        const sets = requireEntry(draft, exercise_id, entry_index).e.sets || []
+        const s = sets[set_index]
+        if (!s) throw invalid(`set_index ${set_index} out of range — this entry has ${sets.length} set${sets.length === 1 ? '' : 's'}`)
+        for (const k of mutable) s[k] = fields[k]
+      })
       return st
     }).then(() => {
       const w2 = requireWorkout(getState(), workout_id)
@@ -1113,6 +1291,263 @@ export const updateWorkoutSet = {
         workout_volume: w2.vol ?? workoutVolume(w2)
       }
     })
+  }
+}
+
+/* ---------- workout create / edit ---------- */
+
+const HHMM = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'must be HH:MM (24-hour)')
+
+// One logged set as the workout tools take it, in the profile's unit. Which fields count depends
+// on the exercise's mode: reps → r (and w), time → sec (and w), cardio → min (and speed).
+const workoutSetSchema = z.object({
+  w: z.number().min(0).optional().describe('Weight (0 or omitted = bodyweight / no load).'),
+  r: z.number().int().min(0).optional().describe('Reps (reps mode).'),
+  sec: z.number().min(0).optional().describe('Duration in seconds (time mode, e.g. a plank).'),
+  min: z.number().min(0).optional().describe('Duration in minutes (cardio mode).'),
+  speed: z.number().min(0).optional().describe('Speed (cardio mode).'),
+  done: z.boolean().optional().describe('Whether the set was completed. Default true; undone sets are kept but count for nothing.'),
+  warmup: z.boolean().optional().describe('A warm-up set: logged, but not counted as work.')
+})
+
+const workoutExerciseSchema = z.object({
+  id: z.string().min(1).describe('Catalog exercise id.'),
+  mode: z.enum(['reps', 'time', 'cardio']).optional().describe('Defaults to the exercise\'s own mode (reps for most, cardio for cardio-catalog exercises).'),
+  note: z.string().optional(),
+  sets: z.array(workoutSetSchema).min(1)
+})
+
+// The row the app would have logged for `set` on an exercise in `mode`.
+function loggedRow(mode, set, label) {
+  const need = mode === 'cardio' ? 'min' : mode === 'time' ? 'sec' : 'r'
+  if (set[need] == null) throw invalid(`${label}: a ${mode} set needs ${need}`)
+  const row = mode === 'cardio'
+    ? { min: set.min, ...(set.speed != null ? { speed: set.speed } : {}) }
+    : mode === 'time' ? { sec: set.sec, w: set.w || 0 } : { w: set.w || 0, r: set.r }
+  row.done = set.done !== false
+  if (set.warmup) row.phase = 'warmup'
+  return row
+}
+
+// A workout entry as a session would hold it before Finish: its rows, and a target naming the
+// exercise and its mode (what get_workout, the history and the 1RM read the rows against).
+function loggedEntry(ex, { rid, routine } = {}) {
+  assertKnownExercise(ex.id)
+  const mode = ex.mode || modeOf({ id: ex.id })
+  const sets = ex.sets.map((set, i) => loggedRow(mode, set, `${exOr(ex.id).n} set ${i + 1}`))
+  const planned = routine?.ex?.find(c => c.id === ex.id)
+  const target = planned && modeOf({ ...planned, id: ex.id }) === mode
+    ? structuredClone(planned)
+    : { id: ex.id, mode, sets: sets.filter(x => !x.phase).length }
+  return {
+    id: ex.id, sets, target,
+    ...(rid ? { rid } : {}),
+    ...(routine?.excludeFromProgression === true ? { noProg: true } : {}),
+    ...(ex.note && ex.note.trim() ? { note: ex.note.trim() } : {})
+  }
+}
+
+// Every change to a saved workout goes through the app's own history editor (session-edit.js):
+// open it as a draft, change the draft, Save. Save recomputes volume and top weights, stamps the
+// record for sync, re-derives the PR badges of every exercise it touches and lowers a kept
+// working weight the edit took away — what the same change made in the app does. The draft is
+// opened on a copy with no session running: a live workout on a device (S.active) is not the
+// editor's, and is left as it is.
+function editSavedWorkout(st, workout_id, change) {
+  requireWorkout(st, workout_id)
+  const draft = { ...st, active: null }
+  editCompletedSession(draft, workout_id)
+  change(draft.active)
+  let saved
+  try {
+    saved = saveWorkoutEdit(draft)
+  } catch (err) {
+    if (err.message === 'Nothing logged yet') throw invalid('that would leave the workout with no completed set — use delete_workout to remove it')
+    throw err
+  }
+  // A badge for an exercise the edit took out of the workout has nothing left to stand on.
+  const ids = new Set((saved.entries || []).map(e => e.id))
+  if ((saved.prs || []).some(id => !ids.has(id))) saved.prs = saved.prs.filter(id => ids.has(id))
+  st.workouts = draft.workouts
+  st.exWeights = draft.exWeights
+  return saved
+}
+
+const workoutView = workout_id => getWorkout.handler({ workout_id })
+
+/** create_workout — log a finished workout (a session done without the app open, or imported). */
+export const createWorkout = {
+  name: 'create_workout',
+  description: 'Log a finished workout into history, like the app\'s "Log a past workout": a date, a start time and duration, and every exercise with its sets as they were done, in the profile\'s unit (get_workout shows it). It is filed in date order and gets PR badges where it beats the sessions before it; later sessions it outdoes lose theirs. It never moves progression or the confirmed working weights. Pass routine_id when it was a session of one of the user\'s routines, so it counts for that routine (and for a rotation pass). It must have at least one completed set and cannot end in the future. Returns the workout as get_workout reads it.',
+  schema: {
+    date: isoDate().describe('YYYY-MM-DD'),
+    time: HHMM.optional().describe('Start time, HH:MM. Default 18:00.'),
+    duration_min: z.number().int().min(1).max(MAX_DURATION_MIN).optional().describe('Minutes. Default 60.'),
+    routine_id: z.string().min(1).optional(),
+    name: z.string().min(1).optional().describe('Defaults to the routine\'s name, or "Freestyle".'),
+    note: z.string().optional(),
+    exercises: z.array(workoutExerciseSchema).min(1)
+  },
+  handler: ({ date, time = '18:00', duration_min = 60, routine_id, name, note, exercises }) => {
+    const S = getState()
+    if (!S) return noState()
+    const routine = routine_id ? requireRoutine(S, routine_id) : null
+    if (endsInFuture(date, time, duration_min)) throw invalid('a logged workout cannot end in the future')
+    withCustomExercises(S)
+    const entries = exercises.map(ex => loggedEntry(ex, { rid: routine?.id, routine }))
+    const start = backfillStart(date, time)
+    const active = {
+      id: crypto.randomUUID(), d: date, start,
+      routineIds: routine ? [routine.id] : [],
+      name: name || routine?.name || 'Freestyle',
+      bw: null, entries,
+      ...(note && note.trim() ? { note } : {})
+    }
+    const w = buildCompletedWorkout(active, { end: start + duration_min * 60000, prs: [] })
+    if (!w.entries.length) throw invalid('nothing to log — no set is marked done')
+    w.vol = workoutVolume(w)
+    stampWorkout(w)
+    return writeState(st => {
+      // Filed and badged the way the app files a workout logged into the past (doFinishWorkout).
+      const touched = [...new Set(w.entries.map(e => e.id))]
+      st.workouts = rebuildPrHistory(insertChronological(st.workouts || [], w), touched, w)
+      refillIfComplete(st, todayIso())
+      return st
+    }).then(() => workoutView(w.id))
+  }
+}
+
+/** update_workout — when it happened, how long it ran, its name and note. */
+export const updateWorkout = {
+  name: 'update_workout',
+  description: 'Change a finished workout\'s details: its date and/or start time (it is re-filed in date order and PR badges are re-derived), its duration, its name, or its session note ("" removes the note). Pass only what changes. Its exercises and sets are changed with add_workout_exercise, remove_workout_exercise, add_workout_set, update_workout_set and remove_workout_set. Returns the workout as get_workout reads it.',
+  schema: {
+    workout_id: z.string().min(1).describe('The workout id from list_workouts.'),
+    date: isoDate().optional().describe('New date, YYYY-MM-DD.'),
+    time: HHMM.optional().describe('New start time, HH:MM.'),
+    duration_min: z.number().int().min(1).max(MAX_DURATION_MIN).optional(),
+    name: z.string().min(1).optional(),
+    note: z.string().optional()
+  },
+  handler: ({ workout_id, date, time, duration_min, name, note }) => {
+    const S = getState()
+    if (!S) return noState()
+    if ([date, time, duration_min, name, note].every(v => v === undefined)) throw invalid('nothing to change — pass at least one of date, time, duration_min, name, note')
+    const w = requireWorkout(S, workout_id)
+    const iso = date ?? w.d
+    const hhmm = time ?? startTimeOf(w)
+    const moving = iso !== w.d || hhmm !== startTimeOf(w)
+    if ((moving || duration_min != null) && endsInFuture(iso, hhmm, duration_min ?? durationMinOf(w))) throw invalid('the workout would end in the future')
+    return writeState(st => {
+      if (name !== undefined || note !== undefined) {
+        editSavedWorkout(st, workout_id, draft => {
+          if (name !== undefined) draft.name = name
+          if (note !== undefined) draft.note = note
+        })
+      }
+      if (moving) st.workouts = moveWorkout(st.workouts, requireWorkout(st, workout_id), iso, hhmm) || st.workouts
+      if (duration_min != null) st.workouts = setWorkoutDuration(st.workouts, requireWorkout(st, workout_id), duration_min) || st.workouts
+      return st
+    }).then(() => workoutView(workout_id))
+  }
+}
+
+/** add_workout_exercise — an exercise that was done but not logged. */
+export const addWorkoutExercise = {
+  name: 'add_workout_exercise',
+  description: 'Add an exercise, with its sets, to a finished workout (one that was done but not logged). Goes at the end, or at `position` (0-based, among the workout\'s exercises as get_workout lists them). Weights in the profile\'s unit. Returns the workout as get_workout reads it.',
+  schema: {
+    workout_id: z.string().min(1).describe('The workout id from list_workouts.'),
+    exercise: workoutExerciseSchema,
+    position: z.number().int().min(0).optional()
+  },
+  handler: ({ workout_id, exercise, position }) => {
+    const S = getState()
+    if (!S) return noState()
+    requireWorkout(S, workout_id)
+    withCustomExercises(S)
+    const entry = loggedEntry(exercise)
+    return writeState(st => {
+      editSavedWorkout(st, workout_id, draft => {
+        draft.entries.splice(Math.min(position ?? draft.entries.length, draft.entries.length), 0, entry)
+      })
+      return st
+    }).then(() => workoutView(workout_id))
+  }
+}
+
+/** remove_workout_exercise — an exercise logged by mistake. */
+export const removeWorkoutExercise = {
+  name: 'remove_workout_exercise',
+  description: 'Remove one exercise, with all its sets, from a finished workout. If the exercise appears more than once, pass entry_index. Removing the last exercise is refused — use delete_workout. Returns the workout as get_workout reads it.',
+  schema: {
+    workout_id: z.string().min(1).describe('The workout id from list_workouts.'),
+    exercise_id: z.string().min(1),
+    entry_index: z.number().int().min(0).optional().describe('If the exercise appears multiple times: 0-based index among the matching entries.')
+  },
+  handler: ({ workout_id, exercise_id, entry_index }) => {
+    const S = getState()
+    if (!S) return noState()
+    requireEntry(requireWorkout(S, workout_id), exercise_id, entry_index)
+    return writeState(st => {
+      editSavedWorkout(st, workout_id, draft => {
+        const { i } = requireEntry(draft, exercise_id, entry_index)
+        draft.entries.splice(i, 1)
+      })
+      return st
+    }).then(() => workoutView(workout_id))
+  }
+}
+
+/** add_workout_set — a set that was done but not logged. */
+export const addWorkoutSet = {
+  name: 'add_workout_set',
+  description: 'Add a set to one exercise of a finished workout. Goes at the end, or at `position` (0-based, in the order get_workout lists the sets). The fields it needs follow the exercise\'s mode: reps → r (and w), time → sec (and w), cardio → min (and speed). Weights in the profile\'s unit. Returns the workout as get_workout reads it.',
+  schema: {
+    workout_id: z.string().min(1).describe('The workout id from list_workouts.'),
+    exercise_id: z.string().min(1),
+    entry_index: z.number().int().min(0).optional().describe('If the exercise appears multiple times: 0-based index among the matching entries.'),
+    set: workoutSetSchema,
+    position: z.number().int().min(0).optional()
+  },
+  handler: ({ workout_id, exercise_id, entry_index, set, position }) => {
+    const S = getState()
+    if (!S) return noState()
+    const { e } = requireEntry(requireWorkout(S, workout_id), exercise_id, entry_index)
+    const mode = modeOf({ ...(e.target || {}), id: exercise_id })
+    const row = loggedRow(mode, set, exOr(exercise_id).n)
+    return writeState(st => {
+      editSavedWorkout(st, workout_id, draft => {
+        const sets = requireEntry(draft, exercise_id, entry_index).e.sets
+        sets.splice(Math.min(position ?? sets.length, sets.length), 0, row)
+      })
+      return st
+    }).then(() => workoutView(workout_id))
+  }
+}
+
+/** remove_workout_set — a set logged by mistake. */
+export const removeWorkoutSet = {
+  name: 'remove_workout_set',
+  description: 'Remove one set from an exercise of a finished workout (set_index is 0-based, in the order get_workout lists them). An exercise left with no completed set drops out of the workout; removing the workout\'s last completed set is refused — use delete_workout. Returns the workout as get_workout reads it.',
+  schema: {
+    workout_id: z.string().min(1).describe('The workout id from list_workouts.'),
+    exercise_id: z.string().min(1),
+    entry_index: z.number().int().min(0).optional().describe('If the exercise appears multiple times: 0-based index among the matching entries.'),
+    set_index: z.number().int().min(0)
+  },
+  handler: ({ workout_id, exercise_id, entry_index, set_index }) => {
+    const S = getState()
+    if (!S) return noState()
+    const { e } = requireEntry(requireWorkout(S, workout_id), exercise_id, entry_index)
+    const count = (e.sets || []).length
+    if (set_index >= count) throw invalid(`set_index ${set_index} out of range — this entry has ${count} set${count === 1 ? '' : 's'}`)
+    return writeState(st => {
+      editSavedWorkout(st, workout_id, draft => {
+        requireEntry(draft, exercise_id, entry_index).e.sets.splice(set_index, 1)
+      })
+      return st
+    }).then(() => workoutView(workout_id))
   }
 }
 
@@ -1250,6 +1685,8 @@ export const updateEquipmentProfiles = {
 export const TOOLS = [
   listRoutines, getRoutine, previewSession, getWeekPlan, listWorkouts, getWorkout, getBodyweight, estimate1rm, muscleBalance,
   createRoutine, updateRoutine, deleteRoutine, progressExercise, swapExercise, scheduleDeload, cancelDeload,
+  setWeekPlan, clearWeekPlan, setDayOverride, clearDayOverride,
+  createWorkout, updateWorkout, addWorkoutExercise, removeWorkoutExercise, addWorkoutSet, removeWorkoutSet,
   relabelWorkoutExercise, updateWorkoutSet, deleteWorkout, getEquipment, updateEquipmentProfiles
 ]
 

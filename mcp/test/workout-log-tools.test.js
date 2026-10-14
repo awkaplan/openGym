@@ -164,7 +164,7 @@ describe('update_workout_set', () => {
     expect(eAfter.topW).toBe(lastDone ? (lastDone.w || null) : null)
   })
 
-  test('undone sets drop out of volume; no done set left → topW null', async () => {
+  test('undone sets drop out of volume; unticking the last done set is refused, as in the app', async () => {
     seedWith(s => {
       const w = s.workouts[0]
       w.entries = [w.entries[0]]
@@ -182,9 +182,10 @@ describe('update_workout_set', () => {
     const r = await call('update_workout_set', { workout_id: wid, exercise_id: eid, set_index: 0, done: false })
     expect(r.set.done).toBe(false)
     expect(r.workout_volume).toBe(300)
-    const r2 = await call('update_workout_set', { workout_id: wid, exercise_id: eid, set_index: 1, done: false })
-    expect(r2.workout_volume).toBe(0)
-    expect(r2.entry_top_w).toBe(null)
+    // A workout with no completed set is an empty row counting as a training day: the app's
+    // editor asks to delete it instead, and so does this.
+    await expect(async () => call('update_workout_set', { workout_id: wid, exercise_id: eid, set_index: 1, done: false })).rejects.toMatchObject({ code: 'EINVAL' })
+    expect(getState().workouts.find(w => w.id === wid).vol).toBe(300)
   })
 
   test('edits cardio sets via min/speed', async () => {

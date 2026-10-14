@@ -340,3 +340,59 @@ describe('shared: no-state fallback for write tools', () => {
 
   afterAll(() => { _seedStateForTests(S = freshState()) })
 })
+/* ---------- per-set targets (pyramid) on create_routine / update_routine ---------- */
+
+describe('per-set targets', () => {
+  const ramp = { id: '0025', pyramid: [10, 8, 6, 'max'], pyramid_weight: [60, 70, 80, 60], pyramid_rest_sec: [90, 120, 180, 0] }
+
+  test('create_routine stores them as the routine editor does, and the session opens on them', async () => {
+    const { id } = await call('create_routine', { name: 'Ramp', exercises: [ramp] })
+    const cfg = resync().routines.find(r => r.id === id).ex[0]
+    expect(cfg).toEqual({ id: '0025', mode: 'reps', sets: 4, reps: 10, pyramid: [10, 8, 6, 'max'], pyramidWeight: [60, 70, 80, 60], pyramidRest: [90, 120, 180, 0] })
+    const work = (await call('preview_session', { routine_id: id })).exercises[0].opening_sets.filter(s => s.phase === 'work')
+    expect(work.map(s => s.w)).toEqual([60, 70, 80, 60])
+    expect(work.map(s => s.r).slice(0, 3)).toEqual([10, 8, 6])
+  })
+
+  test('what get_routine returns can be written back by update_routine unchanged', async () => {
+    const { id } = await call('create_routine', { name: 'Ramp', exercises: [ramp] })
+    resync()
+    const before = (await call('get_routine', { routine_id: id })).exercises[0]
+    expect(before).toMatchObject({ pyramid: ramp.pyramid, pyramid_weight: ramp.pyramid_weight, pyramid_rest_sec: ramp.pyramid_rest_sec })
+    const { pyramid, pyramid_weight, pyramid_rest_sec } = before
+    await call('update_routine', { routine_id: id, exercises: [{ id: '0025', pyramid, pyramid_weight, pyramid_rest_sec }] })
+    resync()
+    expect((await call('get_routine', { routine_id: id })).exercises[0]).toMatchObject({ pyramid, pyramid_weight, pyramid_rest_sec })
+  })
+
+  test('weights alone, without rests; an all-zero list is no field', async () => {
+    const { id } = await call('create_routine', { name: 'Ramp', exercises: [{ id: '0025', pyramid: [5, 5, 5], pyramid_weight: [100, 110, 120], pyramid_rest_sec: [0, 0, 0] }] })
+    const cfg = resync().routines.find(r => r.id === id).ex[0]
+    expect(cfg.pyramidWeight).toEqual([100, 110, 120])
+    expect(cfg).not.toHaveProperty('pyramidRest')
+  })
+
+  test('a pyramid drops a rep range it would otherwise carry', async () => {
+    const { id } = await call('create_routine', { name: 'Ramp', exercises: [{ id: '0025', repsMin: 6, repsMax: 10, pyramid: [10, 8] }] })
+    const cfg = resync().routines.find(r => r.id === id).ex[0]
+    expect(cfg).not.toHaveProperty('repsMin')
+    expect(cfg).not.toHaveProperty('repsMax')
+  })
+
+  test('mismatched lengths, orphan per-set lists, and non-reps modes are refused without writing', async () => {
+    const count = S.routines.length
+    const bad = [
+      { id: '0025', pyramid: [10, 8, 6], pyramid_weight: [60, 70] },
+      { id: '0025', pyramid: [10, 8], pyramid_rest_sec: [60, 60, 60] },
+      { id: '0025', pyramid_weight: [60, 70] },
+      { id: '0025', mode: 'time', pyramid: [10, 8] }
+    ]
+    for (const e of bad) {
+      await expect(async () => call('create_routine', { name: 'Bad', exercises: [e] })).rejects.toMatchObject({ code: 'EINVAL' })
+    }
+    const push = pushRoutine()
+    await expect(async () => call('update_routine', { routine_id: push.id, exercises: [bad[0]] })).rejects.toMatchObject({ code: 'EINVAL' })
+    expect(resync().routines.length).toBe(count)
+    expect(pushRoutine().ex.length).toBe(push.ex.length)
+  })
+})
