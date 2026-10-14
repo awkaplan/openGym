@@ -5,6 +5,9 @@ application (Claude Desktop, Cursor, Cline, Continue, etc.) read your openGym pr
 routines, workouts, body-weight log, estimated 1RMs, and muscle balance — directly from your
 self-hosted `./data` directory.
 
+> **Fork note (awkaplan/openGym, branch `mcp-write-tools`):** this fork adds write tools on top of
+> the read tools below — see **Write tools (fork)**. Upstream's MCP is read-only.
+
 It is read-only, runs locally as a stdio process spawned by the LLM client, adds no new
 container, and requires no extra authentication. The LLM never sees passkeys, VAPID keys, or
 session secrets — it can only read the same `state-<uid>.json` files the openGym api already
@@ -92,6 +95,32 @@ sessions from the last session (`starts_from`). Ask `preview_session` before nam
 Each tool returns JSON the LLM can format as it likes; structured fields (sets, dates, levels)
 are pre-formatted into human-readable labels in `src/labels.js` so the LLM doesn't need to
 re-interpret them.
+
+## Write tools (fork)
+
+Twelve tools that change the profile, ported from Thomas Leclaire's
+[MR !1](https://gitlab.com/tleclaire/opengym/-/merge_requests/1) (originally written against
+v1.2.x) onto v1.4.1:
+
+`create_routine`, `update_routine`, `delete_routine`, `progress_exercise`, `swap_exercise`,
+`schedule_deload`, `cancel_deload`, `relabel_workout_exercise`, `update_workout_set`,
+`delete_workout`, `get_equipment`, `update_equipment_profiles`.
+
+Writes go straight to `state-<uid>.json`, so the data directory must be mounted read-write.
+Changes from the original, needed for v1.4's sync protocol:
+
+- `writeState` does what `PUT /api/data` does for a client that does not stamp its edits: it runs
+  `api/sync-stamps.js`'s `stampPut` (so removals are on record and not resurrected by another
+  device), bumps `_rev` and chains `_wid` / `_wids`. Without that an open app tab pushes its older
+  copy back over an MCP change. The module is loaded from `../../api/sync-stamps.js`, so the `api/`
+  directory has to sit next to `mcp/`, as it does in the repo.
+- `delete_routine` uses the app's own `deleteRoutine` (a weekday holds a list of routines; per-date
+  reschedules name routines too).
+- Every write keeps the previous five states in `state-<uid>.mcp.json`. That file is the only way
+  back from a bad `delete_workout` / `delete_routine`; there is no restore tool.
+
+The MCP and the api are separate processes writing one file: the MCP re-reads it right before each
+write, but there is no cross-process lock.
 
 ## How it reuses the training logic
 
