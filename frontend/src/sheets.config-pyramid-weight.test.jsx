@@ -69,4 +69,21 @@ describe('exercise settings: weight per pyramid set (#445)', () => {
     act(() => save(host))
     expect(onSave.mock.calls[0][0]).not.toHaveProperty('pyramidWeight')
   })
+
+  // The toggle used to read "Pyramid sets — a different rep target for each set", so a lifter
+  // after per-set weights (a ramp up to a top set) never found it. It now names all three.
+  it('is found from a flat plan as Per-set targets, and switching it on gives each set a weight', () => {
+    const { host, onSave } = renderConfig({ pyramid: undefined, sets: 3, reps: 5, weight: 100 })
+    const row = [...host.querySelectorAll('.lrow')].find(r => r.querySelector('.lrow-t')?.textContent === 'Per-set targets')
+    expect(row.querySelector('.lrow-s').textContent).toMatch(/reps, weight and rest/)
+    expect(weightFields(host)).toHaveLength(1)
+    act(() => row.querySelector('[role="switch"]').click())
+    const fields = weightFields(host)
+    expect(fields).toHaveLength(3)
+    act(() => { type(fields[0], '80'); leave(fields[0]) })
+    act(() => { type(fields[1], '90'); leave(fields[1]) })
+    act(() => { type(fields[2], '100'); leave(fields[2]) })
+    act(() => save(host))
+    expect(onSave.mock.calls[0][0]).toMatchObject({ sets: 3, pyramid: [5, 5, 5], pyramidWeight: [80, 90, 100] })
+  })
 })

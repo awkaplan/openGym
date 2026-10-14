@@ -1921,8 +1921,8 @@ function ExConfig({ ex, existing, onSave, onDelete, onReplace, close, routine, i
         subtitle={c.lastToFailure ? t('The last set goes until nothing is left, and counts as all-out effort unless you rate it.') : t('Plan the final set as an all-out one.')}>
         <Switch checked={c.lastToFailure === true} onChange={v => setC(x => ({ ...x, lastToFailure: v || undefined }))} />
       </Row>}
-      {mode === 'reps' && <Row icon="steps" iconTint="var(--acc)" title={t('Pyramid sets')}
-        subtitle={t('A different rep target for each set, e.g. 12 · 8 · 6 · Max · 12.')}>
+      {mode === 'reps' && <Row icon="steps" iconTint="var(--acc)" title={t('Per-set targets')}
+        subtitle={t('Give each set its own reps, weight and rest: a pyramid, or a ramp up to a top set.')}>
         <Switch checked={pyramid} onChange={v => setC(x => (v
           ? { ...x, pyramid: x.pyramidDraft || pyramidFromFlat(x), intensifier: undefined }
           : { ...x, ...flatFromPyramid(x.pyramid), pyramidDraft: x.pyramid, pyramid: undefined }))} />
