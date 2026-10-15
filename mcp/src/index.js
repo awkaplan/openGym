@@ -6,6 +6,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { TOOLS } from './tools.js'
 import { init, getUser } from './state.js'
+import { respond } from './respond.js'
 
 const server = new McpServer({
   name: 'opengym',
@@ -30,18 +31,7 @@ for (const t of TOOLS) {
     t.name,
     t.description,
     t.schema,
-    async (params) => {
-      try {
-        const result = t.handler(params || {})
-        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
-      } catch (err) {
-        const code = err.code || 'ERROR'
-        return {
-          isError: true,
-          content: [{ type: 'text', text: `${code}: ${err.message}` }]
-        }
-      }
-    }
+    params => respond(t, params)
   )
 }
 
