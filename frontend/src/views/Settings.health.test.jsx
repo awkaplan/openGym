@@ -18,6 +18,8 @@ const mocks = vi.hoisted(() => {
   })
   state.enableHealth = vi.fn(async () => { state.health = { ...state.health, on: true }; return { ok: true, health: state.health } })
   state.disableHealth = vi.fn(async ({ removeWritten }) => { state.health = { ...state.health, on: false, written: removeWritten ? {} : state.health.written }; return state.health })
+  state.enableHealthRead = vi.fn(async () => { state.health = { ...state.health, read: { on: true, seen: {}, error: null } }; return { ok: true, added: 2, health: state.health } })
+  state.disableHealthRead = vi.fn(async () => { state.health = { ...state.health, read: { on: false, seen: {}, error: null } }; return state.health })
   state.openHealthConnect = vi.fn(async () => {})
   state.menuSheet = vi.fn()
   state.toast = vi.fn()
@@ -49,6 +51,8 @@ vi.mock('../lib/health-sync.js', () => ({
   loadHealth: () => Promise.resolve(mocks.health),
   enableHealth: (...a) => mocks.enableHealth(...a),
   disableHealth: (...a) => mocks.disableHealth(...a),
+  enableHealthRead: (...a) => mocks.enableHealthRead(...a),
+  disableHealthRead: (...a) => mocks.disableHealthRead(...a),
   openHealthConnect: (...a) => mocks.openHealthConnect(...a),
   onHealthChange: () => () => {},
 }))
@@ -67,7 +71,7 @@ beforeEach(() => {
   mocks.android = true
   mocks.status = { status: 'available', granted: false }
   mocks.health = { on: false, written: {}, error: null }
-  for (const k of ['enableHealth', 'disableHealth', 'openHealthConnect', 'menuSheet', 'toast']) mocks[k].mockClear()
+  for (const k of ['enableHealth', 'disableHealth', 'enableHealthRead', 'disableHealthRead', 'openHealthConnect', 'menuSheet', 'toast']) mocks[k].mockClear()
   host = document.createElement('div')
   document.body.appendChild(host)
   root = createRoot(host)
@@ -83,6 +87,7 @@ const mount = async () => {
 }
 const row = text => [...host.querySelectorAll('.lrow')].find(r => r.textContent.includes(text))
 const writeSwitch = () => row('Write to Health Connect')?.querySelector('[role="switch"]')
+const readSwitch = () => row('Read weigh-ins from Health Connect')?.querySelector('[role="switch"]')
 
 describe('Settings — Health Connect', () => {
   it('is not there on the web build, on iOS, or on a phone without Health Connect', async () => {
@@ -135,5 +140,50 @@ describe('Settings — Health Connect', () => {
     expect(writeSwitch()).toBeUndefined()
     await act(async () => { row('Install Health Connect').click() })
     expect(mocks.openHealthConnect).toHaveBeenCalledTimes(1)
+  })
+
+  it('reading weigh-ins is its own switch: off by default, on through enableHealthRead', async () => {
+    await mount()
+    expect(readSwitch().getAttribute('aria-checked')).toBe('false')
+    await act(async () => { readSwitch().click() })
+    expect(mocks.enableHealthRead).toHaveBeenCalledTimes(1)
+    expect(mocks.enableHealth).not.toHaveBeenCalled()
+    const [getS, update] = mocks.enableHealthRead.mock.calls[0]
+    expect(getS()).toBe(mocks.S)
+    expect(typeof update).toBe('function')
+    expect(readSwitch().getAttribute('aria-checked')).toBe('true')
+    expect(writeSwitch().getAttribute('aria-checked')).toBe('false')
+    expect(mocks.toast).toHaveBeenCalledWith('Reading weigh-ins from Health Connect')
+    expect(row('Open Health Connect')).toBeTruthy()
+  })
+
+  it('turning reading off goes through disableHealthRead and asks nothing', async () => {
+    mocks.health = { on: false, written: {}, error: null, read: { on: true, seen: {}, error: null } }
+    await mount()
+    await act(async () => { readSwitch().click() })
+    expect(mocks.disableHealthRead).toHaveBeenCalledTimes(1)
+    expect(mocks.menuSheet).not.toHaveBeenCalled()
+    expect(readSwitch().getAttribute('aria-checked')).toBe('false')
+  })
+
+  it('says it reads nothing back while only writing is on', async () => {
+    mocks.health = { on: true, written: {}, error: null, read: { on: false } }
+    await mount()
+    expect(host.textContent).toContain('openGym reads nothing back.')
+  })
+
+  it('no longer says it reads nothing back once reading is on', async () => {
+    mocks.health = { on: true, written: {}, error: null, read: { on: true, seen: {}, error: null } }
+    await mount()
+    expect(host.textContent).not.toContain('reads nothing back')
+    expect(host.textContent).toContain('Weigh-ins other apps logged in the last 30 days come in each time you open openGym.')
+  })
+
+  it('offers to grant reading again when Health Connect refused it', async () => {
+    mocks.health = { on: false, written: {}, error: null, read: { on: true, seen: {}, error: 'permission' } }
+    await mount()
+    await act(async () => { row('Permission withdrawn').click() })
+    expect(mocks.enableHealthRead).toHaveBeenCalledTimes(1)
+    expect(mocks.enableHealth).not.toHaveBeenCalled()
   })
 })

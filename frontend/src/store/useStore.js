@@ -473,7 +473,8 @@ export const useStore = create((set, get) => {
   }
 
   initReminderSync(() => get().S)
-  initHealthSync(() => get().S)
+  // `update` takes in weigh-ins read from Health Connect, when that is switched on.
+  initHealthSync(() => get().S, mut => get().update(mut))
 
   // Mobile build: the file mirror, and beside it whose copy it is and which one (its `_ts`) —
   // restoreFromMirror takes the file back only for that account, and only while the two agree,

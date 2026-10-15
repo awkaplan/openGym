@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { healthRecords, planSync, recordKey, sessionRecord, sessionType, SESSION_TYPES, TEXT_MAX, weightRecord, writtenIds } from './health-connect.js'
+import { healthRecords, mergeHealthWeights, planSync, READ_DAYS, recordKey, sessionRecord, sessionType, SESSION_TYPES, TEXT_MAX, weightRecord, writtenIds } from './health-connect.js'
 
 // #200: what the Android app writes to Health Connect, worked out from the state alone.
 const nameOf = e => ({ '0025': 'barbell bench press', '3666': 'walking on incline treadmill', '2138': 'stationary bike run v. 3' })[e.id] || e.id
@@ -85,6 +85,61 @@ describe('healthRecords', () => {
   })
   it('copes with a state that has neither', () => {
     expect(healthRecords({}, { nameOf })).toEqual({ sessions: [], weights: [] })
+  })
+  it('does not hand back a weigh-in that was read from Health Connect', () => {
+    const S = { unit: 'kg', workouts: [], bodyweight: [{ d: '2026-09-17', w: 80, t: at(7) }, { d: '2026-09-18', w: 79.6, t: at(7), src: 'hc' }] }
+    expect(healthRecords(S, { nameOf }).weights.map(s => s.id)).toEqual(['opengym-bw-2026-09-17'])
+  })
+})
+
+describe('mergeHealthWeights', () => {
+  // Readings as HealthConnectPlugin.readWeights returns them: other apps' only.
+  const day = (d, h, m = 0) => new Date(2026, 8, d, h, m).getTime()
+  const reading = (id, d, h, kg, m = 0) => ({ id, time: day(d, h, m), kg })
+  const NOW = day(20, 12)
+
+  it('adds a day you did not log, in your unit, marked as read', () => {
+    const r = mergeHealthWeights([], [reading('a', 18, 7, 80)], { unit: 'lb', now: NOW })
+    expect(r.bodyweight).toEqual([{ d: '2026-09-18', w: 176.4, t: day(18, 7), src: 'hc' }])
+    expect(r).toMatchObject({ added: 1, updated: 0, seen: { a: day(18, 7) } })
+  })
+
+  it('takes the last reading of a day with several', () => {
+    const r = mergeHealthWeights([], [reading('late', 18, 21, 80.4), reading('early', 18, 6, 79.8)], { now: NOW })
+    expect(r.bodyweight).toEqual([{ d: '2026-09-18', w: 80.4, t: day(18, 21), src: 'hc' }])
+  })
+
+  it('never replaces a weigh-in you typed yourself', () => {
+    const mine = [{ d: '2026-09-18', w: 81, t: day(18, 9) }]
+    const r = mergeHealthWeights(mine, [reading('a', 18, 10, 80)], { now: NOW })
+    expect(r.bodyweight).toEqual(mine)
+    expect(r).toMatchObject({ added: 0, updated: 0, seen: { a: day(18, 10) } })
+  })
+
+  it('a later reading the same day replaces one read before, an earlier one does not', () => {
+    const read = [{ d: '2026-09-18', w: 80, t: day(18, 7), src: 'hc' }]
+    expect(mergeHealthWeights(read, [reading('b', 18, 20, 79.5)], { now: NOW }).bodyweight)
+      .toEqual([{ d: '2026-09-18', w: 79.5, t: day(18, 20), src: 'hc' }])
+    expect(mergeHealthWeights(read, [reading('c', 18, 5, 81)], { now: NOW }).updated).toBe(0)
+  })
+
+  it('takes a reading once: a weigh-in deleted here does not come back', () => {
+    const first = mergeHealthWeights([], [reading('a', 18, 7, 80)], { now: NOW })
+    const again = mergeHealthWeights([], [reading('a', 18, 7, 80)], { seen: first.seen, now: NOW })
+    expect(again).toMatchObject({ bodyweight: [], added: 0 })
+  })
+
+  it('forgets what it saw once it is past the window a read looks at', () => {
+    const old = day(18, 7) - (READ_DAYS + 2) * 24 * 60 * 60 * 1000
+    const r = mergeHealthWeights([], [], { seen: { gone: old, kept: day(18, 7) }, now: NOW })
+    expect(r.seen).toEqual({ kept: day(18, 7) })
+  })
+
+  it('skips a reading without an id, a time or a weight, and keeps the list sorted', () => {
+    const have = [{ d: '2026-09-19', w: 80, t: day(19, 7) }]
+    const r = mergeHealthWeights(have, [reading('', 17, 7, 80), reading('x', 17, 7, 0), { id: 'y', kg: 80 }, reading('z', 16, 7, 80.04)], { now: NOW })
+    expect(r.bodyweight.map(b => [b.d, b.w])).toEqual([['2026-09-16', 80], ['2026-09-19', 80]])
+    expect(have).toEqual([{ d: '2026-09-19', w: 80, t: day(19, 7) }])   // the input is left as it was
   })
 })
 

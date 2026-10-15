@@ -2,9 +2,10 @@
 // Connect is the phone's own store for health data: other apps read the workouts and weigh-ins from
 // there. Nothing here talks to it — lib/health-sync.js hands these records to the native plugin.
 //
-// Write-only, and only on request: the user turns it on in Settings, on each phone. Every record
-// carries a client id of its own (a workout's id, a weigh-in's day), so writing it again replaces
-// it instead of adding a second one, and anything openGym wrote can be found and removed again.
+// Only on request: the user turns it on in Settings, on each phone. Every record carries a client
+// id of its own (a workout's id, a weigh-in's day), so writing it again replaces it instead of
+// adding a second one, and anything openGym wrote can be found and removed again. Reading weigh-ins
+// back is a second switch of its own (mergeHealthWeights, below).
 import { workoutText } from './workout-text.js'
 import { modeForEntry, hasCompletedWork } from './workout-model.js'
 import { isoOf } from './format.js'
@@ -80,13 +81,69 @@ function localMorning(iso) {
   return new Date(y, m - 1, d, 8, 0, 0, 0).getTime()
 }
 
-/** Everything the state has to give Health Connect: { sessions, weights }. */
+/** Everything the state has to give Health Connect: { sessions, weights }. A weigh-in read from
+ *  Health Connect (`src: 'hc'`) is not handed back: the app that logged it already has it there. */
 export function healthRecords(S, { nameOf, speedUnit }) {
   const unit = S?.unit === 'lb' ? 'lb' : 'kg'
   return {
     sessions: (S?.workouts || []).map(w => sessionRecord(w, { unit, nameOf, speedUnit })).filter(Boolean),
-    weights: (S?.bodyweight || []).map(b => weightRecord(b, unit)).filter(Boolean),
+    weights: (S?.bodyweight || []).filter(b => b?.src !== HC_SOURCE).map(b => weightRecord(b, unit)).filter(Boolean),
   }
+}
+
+// ---- Reading weigh-ins back ----
+//
+// The other direction, also off until turned on: weight another app logged in Health Connect (a
+// smart scale's app, a fitness tracker) becomes an openGym weigh-in. One weigh-in per day, as
+// everywhere else, so a day with several readings takes the last one. Such a weigh-in is marked
+// `src: 'hc'`; one you type yourself never is, and is never replaced by a reading. A reading is
+// taken once (`seen`, by its Health Connect id), so a weigh-in you delete here does not come back
+// on the next read.
+
+export const HC_SOURCE = 'hc'
+// How far back each read looks. Health Connect itself gives an app the 30 days before it was
+// granted access and everything after, so a first read gets at most that much history.
+export const READ_DAYS = 30
+const DAY_MS = 24 * 60 * 60 * 1000
+
+const roundTenth = n => Math.round(n * 10) / 10
+
+/**
+ * Health Connect readings ([{ id, time, kg }], from other apps) merged into `bodyweight`.
+ * Returns { bodyweight, added, updated, seen } — a new list, sorted by day, and the `seen` to keep
+ * for the next read: every reading taken now (whether or not it changed a day), pruned to the
+ * window a read looks at, plus a day of slack.
+ */
+export function mergeHealthWeights(bodyweight, readings, { unit = 'kg', seen = {}, now = Date.now() } = {}) {
+  const out = (Array.isArray(bodyweight) ? bodyweight : []).map(b => ({ ...b }))
+  const nextSeen = {}
+  const keepFrom = now - (READ_DAYS + 1) * DAY_MS
+  for (const [id, time] of Object.entries(seen || {})) if (Number(time) >= keepFrom) nextSeen[id] = Number(time)
+  // The last fresh reading of each local day.
+  const byDay = new Map()
+  for (const r of Array.isArray(readings) ? readings : []) {
+    const time = Number(r?.time), kg = Number(r?.kg)
+    if (!r?.id || !(time > 0) || !(kg > 0) || nextSeen[r.id] != null) continue
+    nextSeen[r.id] = time
+    const d = isoOf(new Date(time))
+    const cur = byDay.get(d)
+    if (!cur || time > cur.time) byDay.set(d, { time, kg })
+  }
+  let added = 0, updated = 0
+  for (const [d, { time, kg }] of byDay) {
+    const w = roundTenth(unit === 'lb' ? kg * LB_PER_KG : kg)
+    const have = out.find(b => b.d === d)
+    if (!have) {
+      out.push({ d, w, t: time, src: HC_SOURCE })
+      added++
+    } else if (have.src === HC_SOURCE && time > (Number(have.t) || 0)) {
+      // A later reading the same day, over one read before. A day you typed yourself stays yours.
+      Object.assign(have, { w, t: time })
+      updated++
+    }
+  }
+  out.sort((a, b) => (a.d < b.d ? -1 : a.d > b.d ? 1 : 0))
+  return { bodyweight: out, added, updated, seen: nextSeen }
 }
 
 // A record's content as a short fingerprint, to tell a changed record from one already written as

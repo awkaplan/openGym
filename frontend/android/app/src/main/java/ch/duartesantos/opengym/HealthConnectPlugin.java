@@ -10,7 +10,11 @@ import androidx.health.connect.client.PermissionController;
 import androidx.health.connect.client.records.ExerciseSessionRecord;
 import androidx.health.connect.client.records.Record;
 import androidx.health.connect.client.records.WeightRecord;
+import androidx.health.connect.client.records.metadata.DataOrigin;
 import androidx.health.connect.client.records.metadata.Metadata;
+import androidx.health.connect.client.request.ReadRecordsRequest;
+import androidx.health.connect.client.response.ReadRecordsResponse;
+import androidx.health.connect.client.time.TimeRangeFilter;
 import androidx.health.connect.client.units.Mass;
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
@@ -37,9 +41,14 @@ import org.json.JSONObject;
 
 /**
  * Writes finished workouts and weigh-ins to Health Connect (#200), the phone's own store for
- * health data, so other apps can read them. Write-only and off until the user turns it on in
- * Settings: no permission is asked for before that. What to write is worked out in JS
+ * health data, so other apps can read them. Off until the user turns it on in Settings: no
+ * permission is asked for before that. What to write is worked out in JS
  * (lib/health-connect.js); this side only turns those plain objects into records.
+ *
+ * Reading is a second, separate switch: weigh-ins other apps logged (a smart scale's app) come
+ * back as plain { id, time, kg } objects, and JS decides what becomes an openGym weigh-in. It has
+ * its own permission, asked for only when that switch is turned on, so turning on writing never
+ * asks to read and the other way round. Records openGym wrote itself are never returned.
  *
  * Every record carries openGym's own id as its clientRecordId, so writing it again replaces it,
  * and "remove" finds exactly the records openGym wrote. The version is the time of the write:
@@ -54,8 +63,10 @@ import org.json.JSONObject;
  *
  * Usage from JS (lib/health-sync.js):
  *   const HC = registerPlugin('HealthConnect');
- *   await HC.status();              // { status: 'available' | 'update' | 'missing' | 'unsupported', granted }
- *   await HC.requestPermissions();  // { granted }
+ *   await HC.status();              // { status: 'available' | 'update' | 'missing' | 'unsupported', granted, readGranted }
+ *   await HC.requestPermissions();  // { granted }  (the two write permissions)
+ *   await HC.requestReadPermission(); // { granted }  (read weight only)
+ *   await HC.readWeights({ since }); // { weights: [{ id, time, kg }] }, other apps' only
  *   await HC.write({ sessions: [...], weights: [...] });
  *   await HC.remove({ sessions: [ids], weights: [ids] });
  *   await HC.openSettings();        // Health Connect's data screen, or its store page
@@ -67,6 +78,9 @@ public class HealthConnectPlugin extends Plugin {
     // The literal permission names, as declared in AndroidManifest.xml.
     private static final String WRITE_EXERCISE = "android.permission.health.WRITE_EXERCISE";
     private static final String WRITE_WEIGHT = "android.permission.health.WRITE_WEIGHT";
+    private static final String READ_WEIGHT = "android.permission.health.READ_WEIGHT";
+    // How many records one read page holds; a month of weigh-ins fits in one.
+    private static final int PAGE = 1000;
     // Health Connect takes at most this many records in one insert.
     private static final int CHUNK = 500;
 
@@ -82,6 +96,10 @@ public class HealthConnectPlugin extends Plugin {
         p.add(WRITE_EXERCISE);
         p.add(WRITE_WEIGHT);
         return p;
+    }
+
+    private static Set<String> readPermissions() {
+        return Collections.singleton(READ_WEIGHT);
     }
 
     private String sdkStatus() {
@@ -111,14 +129,17 @@ public class HealthConnectPlugin extends Plugin {
             JSObject r = new JSObject();
             r.put("status", status);
             r.put("granted", false);
+            r.put("readGranted", false);
             call.resolve(r);
             return;
         }
         worker.execute(() -> {
             try {
+                Set<String> has = granted();
                 JSObject r = new JSObject();
                 r.put("status", status);
-                r.put("granted", granted().containsAll(permissions()));
+                r.put("granted", has.containsAll(permissions()));
+                r.put("readGranted", has.containsAll(readPermissions()));
                 call.resolve(r);
             } catch (Exception e) {
                 call.reject(e.getMessage(), "failed");
@@ -149,6 +170,81 @@ public class HealthConnectPlugin extends Plugin {
                 JSObject r = new JSObject();
                 r.put("granted", (got != null && got.containsAll(permissions())) || granted().containsAll(permissions()));
                 call.resolve(r);
+            } catch (Exception e) {
+                call.reject(e.getMessage(), "failed");
+            }
+        });
+    }
+
+    @PluginMethod
+    public void requestReadPermission(PluginCall call) {
+        if (!"available".equals(sdkStatus())) {
+            call.reject("Health Connect is not available", "unavailable");
+            return;
+        }
+        ActivityResultContract<Set<String>, Set<String>> contract = PermissionController.createRequestPermissionResultContract(PROVIDER);
+        Intent intent = contract.createIntent(getContext(), readPermissions());
+        startActivityForResult(call, intent, "readPermissionResult");
+    }
+
+    @ActivityCallback
+    private void readPermissionResult(PluginCall call, ActivityResult result) {
+        if (call == null) return;
+        ActivityResultContract<Set<String>, Set<String>> contract = PermissionController.createRequestPermissionResultContract(PROVIDER);
+        Set<String> got = contract.parseResult(result.getResultCode(), result.getData());
+        worker.execute(() -> {
+            try {
+                JSObject r = new JSObject();
+                r.put("granted", (got != null && got.containsAll(readPermissions())) || granted().containsAll(readPermissions()));
+                call.resolve(r);
+            } catch (Exception e) {
+                call.reject(e.getMessage(), "failed");
+            }
+        });
+    }
+
+    /**
+     * Weigh-ins in Health Connect from `since` (epoch ms) on, oldest first, leaving out the ones
+     * openGym wrote: by the app that wrote them, and by openGym's own client id as well, for a
+     * record written under another build's package name (a debug build, a renamed package).
+     */
+    @PluginMethod
+    public void readWeights(PluginCall call) {
+        if (!"available".equals(sdkStatus())) {
+            call.reject("Health Connect is not available", "unavailable");
+            return;
+        }
+        long since = call.getLong("since", 0L);
+        String own = getContext().getPackageName();
+        worker.execute(() -> {
+            try {
+                JSArray out = new JSArray();
+                String page = null;
+                do {
+                    ReadRecordsRequest<WeightRecord> request = new ReadRecordsRequest<>(
+                            JvmClassMappingKt.getKotlinClass(WeightRecord.class),
+                            TimeRangeFilter.after(Instant.ofEpochMilli(since)),
+                            Collections.<DataOrigin>emptySet(), true, PAGE, page);
+                    @SuppressWarnings("unchecked")
+                    ReadRecordsResponse<WeightRecord> response = (ReadRecordsResponse<WeightRecord>)
+                            BuildersKt.runBlocking(EmptyCoroutineContext.INSTANCE, (scope, cont) -> client().readRecords(request, cont));
+                    for (WeightRecord w : response.getRecords()) {
+                        Metadata m = w.getMetadata();
+                        String client = m.getClientRecordId();
+                        if (own.equals(m.getDataOrigin().getPackageName()) || (client != null && client.startsWith("opengym-"))) continue;
+                        JSObject r = new JSObject();
+                        r.put("id", m.getId());
+                        r.put("time", w.getTime().toEpochMilli());
+                        r.put("kg", w.getWeight().getKilograms());
+                        out.put(r);
+                    }
+                    page = response.getPageToken();
+                } while (page != null && !page.isEmpty());
+                JSObject r = new JSObject();
+                r.put("weights", out);
+                call.resolve(r);
+            } catch (SecurityException e) {
+                call.reject(e.getMessage(), "permission");
             } catch (Exception e) {
                 call.reject(e.getMessage(), "failed");
             }

@@ -191,12 +191,30 @@ that.
   Each weigh-in as a weight record, in kilograms. A workout without a real start and end is left
   out rather than given made-up times. `src/lib/health-connect.js` works this out; its tests
   pin it.
-- **Write-only.** The manifest declares `WRITE_EXERCISE` and `WRITE_WEIGHT` and nothing else, and
-  openGym reads nothing back.
+- **Reading weigh-ins back is a second switch.** "Read weigh-ins from Health Connect" asks for
+  `READ_WEIGHT` alone (writing keeps its own `WRITE_EXERCISE` and `WRITE_WEIGHT`, so neither switch
+  asks for the other's permission). With it on, weight other apps logged there — a smart scale's
+  app, a fitness tracker — becomes an openGym weigh-in:
+  - one per day, the day's last reading, converted to the profile's unit;
+  - a day you logged yourself is never replaced; a day it read before takes a later reading of
+    that day;
+  - each reading is taken once (its Health Connect id is remembered on the phone), so a weigh-in
+    deleted in openGym does not come back;
+  - read-in weigh-ins carry `src: 'hc'` and are not written back to Health Connect, so writing and
+    reading together never duplicate a reading there. Typing over one in openGym makes it yours:
+    the mark goes, and it is written back like any other;
+  - records openGym itself wrote are never read (by the app that wrote them, and by the `opengym-`
+    client id).
+
+  It reads the last 30 days at launch and each time the app comes back to the foreground. Health
+  Connect gives an app the 30 days before it was granted access and everything after, so the first
+  read brings at most a month of history; for more, import a CSV once. The rules are
+  `mergeHealthWeights` in `src/lib/health-connect.js`, tested there.
 - **No duplicates.** Every record carries openGym's own id as its `clientRecordId`
   (`opengym-w-<workout id>`, `opengym-bw-<day>`), so writing it again replaces it. An edited workout
   or weigh-in is written again; a deleted one is removed from Health Connect.
-- **This phone only.** Whether it is on, and a fingerprint of each record already written, live in
+- **This phone only.** Whether each switch is on, a fingerprint of each record already written, and
+  the readings already taken, live in
   `opengym-health.json` in the app's data directory, never in the synced state: it does not travel
   to a server, into a backup export, or to a second phone. It works the same in local mode and
   paired with a server, because the writing happens on the phone.
@@ -216,7 +234,9 @@ that.
 
 Worth checking on a real device after changes here: turning it on shows Health Connect's own
 permission screen; a finished workout appears in Health Connect within a few seconds; deleting it
-in openGym removes it there; turning it off with "remove" leaves no openGym record behind.
+in openGym removes it there; turning it off with "remove" leaves no openGym record behind. For
+reading: turning it on asks only for weight; a weigh-in from another app shows up after reopening
+openGym, and does not show up a second time in Health Connect.
 
 ## Prerequisites
 

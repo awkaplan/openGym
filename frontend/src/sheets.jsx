@@ -304,7 +304,9 @@ function BwSheet({ required, onDone, close }) {
     update(s => {
       const iso = todayISO()
       const ex = s.bodyweight.find(b => b.d === iso)
-      if (ex) { ex.w = n; ex.t = Date.now() } else s.bodyweight.push({ d: iso, w: n, t: Date.now() })
+      // A weigh-in typed over one read from Health Connect is yours from then on: written back
+      // there like any other, and never replaced by a later reading (lib/health-connect.js).
+      if (ex) { ex.w = n; ex.t = Date.now(); delete ex.src } else s.bodyweight.push({ d: iso, w: n, t: Date.now() })
       s.bodyweight.sort((a, b) => (a.d < b.d ? -1 : 1))
     })
     close()

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, forwardRef, useSyncExternalStore } from 'react'
 import { useNavigate, useParams, useLocation, Navigate } from 'react-router-dom'
 import { useStore, DEF, hasData } from '../store/useStore.js'
-import { healthStatus, loadHealth, enableHealth, disableHealth, openHealthConnect, onHealthChange } from '../lib/health-sync.js'
+import { healthStatus, loadHealth, enableHealth, disableHealth, enableHealthRead, disableHealthRead, openHealthConnect, onHealthChange } from '../lib/health-sync.js'
 import { workoutControls } from '../lib/workout-controls.js'
 import { speedUnitOf } from '../lib/speed.js'
 import { formulaOf, FORMULA_NAMES } from '../lib/onerm.js'
@@ -784,7 +784,7 @@ export default function Settings({ page = null, find = null, via = null }) {
         {/* Android only: the system folder picker (#161). iOS shows Documents in Files already. */}
         {MOBILE && android && S.autoBackup && <BackupFolderRow />}
       </Section>
-      {MOBILE && android && <HealthConnectCard S={S} toast={toast} />}
+      {MOBILE && android && <HealthConnectCard S={S} update={update} toast={toast} />}
       <Section title={t('Bring data in')}>
         <Row icon="download" iconTint="var(--teal)" title={t('Import backup')} accessory="chevron" onClick={() => fileRef.current.click()} />
         <Row icon="download" iconTint="var(--teal)" title={t('Import from another app')}
@@ -1429,11 +1429,12 @@ function RegisterInline({ close, setUser, pushState, pullState, toast }) {
 }
 
 // Android app: writing finished workouts and weigh-ins to Health Connect (#200), the phone's
-// own store for health data, where other apps can read them. A fact about this phone, kept in
-// its own file (lib/health-sync.js) and not in S, so it never switches on anywhere else. The card
-// stays out of the way on a phone without Health Connect, and only points to installing it on
-// Android 13 and lower, where it is an app of its own.
-function HealthConnectCard({ S, toast }) {
+// own store for health data, where other apps can read them — and, on a switch of its own,
+// reading weigh-ins other apps logged there (a smart scale) back in. Facts about this phone, kept
+// in its own file (lib/health-sync.js) and not in S, so they never switch on anywhere else. The
+// card stays out of the way on a phone without Health Connect, and only points to installing it
+// on Android 13 and lower, where it is an app of its own.
+function HealthConnectCard({ S, update, toast }) {
   const [st, setSt] = useState(null)
   const [h, setH] = useState(null)
   const [busy, setBusy] = useState(false)
@@ -1482,16 +1483,48 @@ function HealthConnectCard({ S, toast }) {
     ],
   })
 
+  // Reading: on reads once straight away; off keeps what it already took in, as your weigh-ins.
+  const getS = () => useStore.getState().S
+  const readOn = async () => {
+    setBusy(true)
+    try {
+      const r = await enableHealthRead(getS, update)
+      setH(r.health || await loadHealth())
+      if (r.ok) toast(t('Reading weigh-ins from Health Connect'))
+      else toast(r.reason === 'denied' ? t('Health Connect permission not granted') : t('Could not read from Health Connect'))
+    } catch { toast(t('Could not read from Health Connect')) }
+    setBusy(false)
+  }
+  const readOff = async () => {
+    setBusy(true)
+    try { setH(await disableHealthRead()) } catch { /* stays as it was */ }
+    setBusy(false)
+  }
+  const read = h.read || {}
+
+  // What each switch that is on does, in one footer.
+  const footer = [
+    h.on && (read.on
+      ? t('Workouts and weigh-ins go to Health Connect when you finish or change them.')
+      : t('Workouts and weigh-ins go to Health Connect when you finish or change them. openGym reads nothing back.')),
+    read.on && t('Weigh-ins other apps logged in the last 30 days come in each time you open openGym.'),
+  ].filter(Boolean).join(' ') || null
+
   return (
-    <Section title={t('Health Connect')}
-      footer={h.on ? t('Workouts and weigh-ins go to Health Connect when you finish or change them. openGym reads nothing back.') : null}>
+    <Section title={t('Health Connect')} footer={footer}>
       <Row icon="heart" iconTint="var(--red)" title={t('Write to Health Connect')}
         subtitle={t('Finished workouts and weigh-ins, from this phone only.')}>
         <Switch checked={!!h.on} disabled={busy} onChange={v => (v ? turnOn() : askOff())} />
       </Row>
       {h.on && h.error === 'permission' && <Row icon="warning" iconTint="var(--orange)"
         title={t('Permission withdrawn. Tap to allow again')} accessory="chevron" onClick={turnOn} />}
-      {h.on && <Row icon="list" iconTint="var(--blue)" title={t('Open Health Connect')}
+      <Row icon="download" iconTint="var(--teal)" title={t('Read weigh-ins from Health Connect')}
+        subtitle={t('Weight other apps log there, such as a smart scale. Days you logged yourself stay as they are.')}>
+        <Switch checked={!!read.on} disabled={busy} onChange={v => (v ? readOn() : readOff())} />
+      </Row>
+      {read.on && read.error === 'permission' && <Row icon="warning" iconTint="var(--orange)"
+        title={t('Permission withdrawn. Tap to allow again')} accessory="chevron" onClick={readOn} />}
+      {(h.on || read.on) && <Row icon="list" iconTint="var(--blue)" title={t('Open Health Connect')}
         accessory="chevron" onClick={() => openHealthConnect().catch(() => {})} />}
     </Section>
   )
