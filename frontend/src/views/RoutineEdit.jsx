@@ -8,7 +8,7 @@ import { uid, exerciseNameText } from '../lib/format.js'
 import { t, exerciseNameFor, exerciseNameClass } from '../lib/i18n.js'
 import { supersetUnits, moveRoutineEntry, cleanupSg, exLine, defaultConfig } from '../lib/history.js'
 import { Thumb } from '../components/Media.jsx'
-import { glyphPicker, exercisePicker, exConfigSheet, confirmSheet, supersetSheet } from '../sheets.jsx'
+import { glyphPicker, exercisePicker, exConfigSheet, confirmSheet, supersetSheet, setTagsSheet } from '../sheets.jsx'
 import { supersetMeta, setSupersetMeta } from '../lib/superset-meta.js'
 import { fmtRest } from '../lib/duration.js'
 import Icon from '../components/Icon.jsx'
@@ -494,6 +494,11 @@ export default function RoutineEdit() {
       {r.excludeFromProgression
         ? t('A deload routine opens at the numbers set here, so the progression above does not apply to it.') + ' ' + t('The next regular target continues from the last included workout.')
         : t(POLICY_DESC[r.prog || 'linear'] || POLICY_DESC.linear) + ' ' + t('Applies to every exercise in this routine that does not set its own rule.')}
+    </div>
+    {/* The labels this routine's workouts offer for annotating a set (lib/set-tags.js). */}
+    <div className="sect-b" style={{ marginBottom: 16 }}>
+      <Row icon="tag" iconTint="var(--blue)" title={t('Set labels')} subtitle={(r.setTags || []).join(', ') || t('None yet')}
+        accessory="chevron" onClick={() => setTagsSheet(id)} />
     </div>
 
     {missingCount > 0 && <div className="card" style={{ marginBottom: 16, borderColor: 'var(--orange)' }}>

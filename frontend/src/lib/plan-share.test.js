@@ -99,6 +99,18 @@ describe('what survives a shared plan', () => {
     expect(target.routines[0].excludeFromProgression).toBe(true)
   })
 
+  it('carries a routine’s set labels through export and merge, cleaned', () => {
+    const source = stateWith({})
+    source.routines[0].setTags = ['Belt', ' belt ', 'Paused']
+    const bundle = parsePlan(buildPlanBundle(source, 'Plan'))
+    const target = { routines: [], week: {}, customEx: [] }
+    expect(bundle.routines[0].setTags).toEqual(['Belt', 'Paused'])
+    mergePlan(target, bundle)
+    expect(target.routines[0].setTags).toEqual(['Belt', 'Paused'])
+    // A routine without labels carries no key.
+    expect('setTags' in parsePlan(buildPlanBundle(stateWith({}), 'Plan')).routines[0]).toBe(false)
+  })
+
   // Issue #10: the rest an exercise prescribes is part of the prescription. A shared 5x5 whose
   // rests arrive as the recipient's 60 s default is a different session than the one written.
   it('carries a per-exercise rest', () => {

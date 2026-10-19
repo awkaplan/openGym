@@ -157,6 +157,10 @@ export const DEF = {
   // lib/bar.js). Personal equipment, so it syncs with the account but never travels in a
   // shared plan. Logged weights stay the total — this only feeds the plate math.
   barWeights: {},
+  // Your own bar per bar type, for every workout: { barbell: 15, … } in the profile unit
+  // (lib/bar.js standardBarWeight). Absent type = the standard 20 kg / 45 lb and friends. An
+  // exercise's own barWeights entry still wins. Display only too, like barWeights.
+  barDefaults: {},
   // Plate inventory, per unit: { lb: { 45: 1, 35: 1, …, _ts }, kg: { … } } — pairs of each size
   // you own (lib/plates.js), stamped with when the list was last changed so a sync keeps the
   // later one (lib/sync-merge.js). Kept per unit: a 45 lb plate is not a 20.4 kg one, so a unit

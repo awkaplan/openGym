@@ -5,7 +5,8 @@ import { EXDB, EXIDX, BODYPARTS, isCardio, isBodyweightEq, allExercises, equipme
 import { activeProfile, exAvailable, ALL_EQUIPMENT, newProfile, profileEquipment, ACC_V } from './lib/equipment.js'
 import { fmtDate, fmtDateRange, fmtNum, fmtPlate, exerciseNameText, fmtVol, fmtDur, durPart, todayISO, isoOf, uid, exCount, routineCount, setsWorkCount, DAYN, DAYS, weekOrder, weekStartOf, weekDayOffset, MONTHS_LONG, ACCENTS } from './lib/format.js'
 import { lastEntryFor, bestWeightFor, bestWeightForEntry, buildSets, effectiveRoutineIds, workoutDay, workoutVolume, setsDone, setsDoneActive, setUnitsTotal, lastBW, sessionSections, setLabel, defaultConfig, cleanupSg, modeOf, effortOf, EFFORT, capEffort, stepEffort, isBw, isPerSide, sideReps, workSetsDone, applyIntensifierPlan, MAX_PLANNED_WARMUPS, NOTE_MAX } from './lib/history.js'
-import { usesBar, defaultBarWeight, hasBarOverride, isNoBar } from './lib/bar.js'
+import { sessionSetTags, cleanSetTags, withSetTag, withoutSetTag, annotateSet, isAnnotated, setAnnotationLine, SET_TAG_MAX, SET_TAGS_MAX } from './lib/set-tags.js'
+import { usesBar, defaultBarWeight, standardBarWeight, hasBarOverride, isNoBar, BAR_TYPES, hasOwnBarDefault, withBarDefault } from './lib/bar.js'
 import { PLATE_SIZES, pairsOf, ownsPlates, withPlatePairs, withStandardPlates, withLoadKind, loadKindFor, baseWeightFor, dropGrid } from './lib/plates.js'
 import { toScale, rirOf, EFFORT_PRESETS, effortColor } from './lib/effort.js'
 import { beep, vibrate } from './lib/sound.js'
@@ -754,7 +755,7 @@ function BarWeightEditor({ ex, cfg, extra }) {
   const kind = loadKindFor(st, ctx)
   const explicit = hasBarOverride(st, ex.id)
   const noBar = bar && isNoBar(st, ex.id)
-  const def = defaultBarWeight(ex.eq, st.unit)
+  const def = standardBarWeight(st, ex.eq)
   const base = baseWeightFor(st, ex)
   // The kinds a pick would only be restating. With a `cfg` there is one: the same default the
   // rows derive. Without one the equipment decides — and for body-weight equipment that answer
@@ -869,6 +870,37 @@ function PlateInventorySheet({ close }) {
   </>
 }
 export const plateInventorySheet = () => ui().openSheet(close => <PlateInventorySheet close={close} />)
+
+// Your own bar for every workout (Settings → Equipment → Bar weights; lib/bar.js S.barDefaults):
+// one weight per bar type, in the profile unit, that every exercise on that bar starts from. An
+// exercise's own bar (its Plate loading sheet) still wins. A stepper back on the standard weight
+// takes the key away, and so does Reset, so the profile follows the standard bar again.
+function BarDefaultsSheet({ close }) {
+  const st = useStore(s => s.S)
+  const unit = st.unit === 'lb' ? 'lb' : 'kg'
+  const set = (eq, v) => update(s => { s.barDefaults = withBarDefault(s.barDefaults, eq, v, s.unit) })
+  const own = BAR_TYPES.some(eq => hasOwnBarDefault(st, eq))
+  return <>
+    <h3>{t('Bar weights')}</h3>
+    <div className="muted small" style={{ marginBottom: 14 }}>
+      {t('The bar every workout starts from, for the plate math and the lightest warm-up. An exercise with its own bar keeps it.')}
+    </div>
+    {BAR_TYPES.map(eq => (
+      <div key={eq} style={{ marginBottom: 10 }}>
+        <div className="row cfgrow" style={{ marginBottom: 2 }}>
+          <Stepper label={t(eq) + ' (' + unit + ')'} value={standardBarWeight(st, eq)} step={unit === 'lb' ? 5 : 2.5} onChange={v => set(eq, v)} />
+        </div>
+        <div className="small dim">
+          {hasOwnBarDefault(st, eq) ? t('Yours. The standard bar is {0}.', fmtNum(defaultBarWeight(eq, unit)) + ' ' + unit) : t('Standard bar.')}
+        </div>
+      </div>
+    ))}
+    <div style={{ height: 6 }} />
+    {own && <Button onClick={() => update(s => { s.barDefaults = {} })} style={{ marginBottom: 8 }}>{t('Back to the standard bars')}</Button>}
+    <Button variant="primary" onClick={close}>{t('Done')}</Button>
+  </>
+}
+export const barDefaultsSheet = () => ui().openSheet(close => <BarDefaultsSheet close={close} />)
 
 // The dumbbells you own, for the profile's unit (Settings → Equipment → Dumbbells, issue #376):
 // a list of single bells, kept per unit like the plates (lib/dumbbells.js). With one, progression,
@@ -2477,6 +2509,11 @@ function WorkoutDetail({ w, close }) {
       {ex && <Thumb ex={ex} />}
       <div className="grow"><div className={`tt ${exerciseNameClass(ex)}`} style={{ fontWeight: 600 }}>{nameOf(e)} {w.prs && w.prs.includes(e.id) && <span className="pr"><Icon name="trophy" />PR</span>}</div>
         <div className="ss">{e.sets.filter(hasCompletedWork).map(s => setLabel(e.id, s, e.target, speedUnitOf(st))).join('  ·  ') || t('no sets')}</div>
+        {/* Each annotated set on its own line (lib/set-tags.js), after what it lifted. */}
+        {e.sets.filter(s => hasCompletedWork(s) && isAnnotated(s)).map((s, k) => <div key={'a' + k} className="small dim row" style={{ gap: 5, marginTop: 3, alignItems: 'flex-start' }}>
+          <Icon name="tag" style={{ fontSize: 12, marginTop: 2, flex: 'none', color: 'var(--acc)' }} />
+          <span>{setLabel(e.id, s, e.target, speedUnitOf(st))}: {setAnnotationLine(s)}</span>
+        </div>)}
         {e.note && <div className="small dim" style={{ marginTop: 3 }}>
           {e.notePin && <Icon name="pin" style={{ fontSize: 12, marginInlineEnd: 4, verticalAlign: '-1px', color: 'var(--yellow)' }} />}{e.note}
         </div>}</div>
@@ -2789,6 +2826,9 @@ export function beginWorkout(routineIds, bw) {
       // Snapshot the layout at start so the header ⋮ can change it for this session only —
       // changing the saved default (Settings → Workout view) mid-session leaves it alone.
       workoutView: st.workoutView || 'cards',
+      // The set annotations this workout offers (lib/set-tags.js): its routines' own lists,
+      // copied so a label added mid-session stays with the session until you save it back.
+      ...(() => { const tags = sessionSetTags(routines); return tags.length ? { setTags: tags } : {} })(),
     }
   })
   useUI.getState().stopRest()
@@ -2944,6 +2984,8 @@ function AddRoutineToSession({ close }) {
       // exercises out too, the same as an exercise added on its own.
       s.active.entries.push(...entries.map(e => joinSessionNoProg(s.active, e)))
       s.active.routineIds = [...[].concat(s.active.routineIds || []), r.id]
+      const tags = cleanSetTags([...(s.active.setTags || []), ...sessionSetTags([r])])
+      if (tags.length) s.active.setTags = tags
       if (!s.active.customName) {
         s.active.name = deriveSessionName(s.active.routineIds.map(id => s.routines.find(x => x.id === id)?.name).filter(Boolean))
       }
@@ -3044,30 +3086,62 @@ function ExerciseNote({ entryIdx, close }) {
 }
 export const exerciseNoteSheet = entryIdx => ui().openSheet(close => <ExerciseNote entryIdx={entryIdx} close={close} />)
 
+// A set's annotations (lib/set-tags.js): the workout's labels as chips to tick, a field to add
+// a label of your own (it joins this workout's list), and a line of free text. The chips are the
+// workout's list plus any label already on a set of this session, so editing a logged workout,
+// whose list is not kept, still offers what its sets wear.
 function SetNote({ entryIdx, setIdx, close }) {
   const noteRef = useRef(null)
   const onNoteFocus = useSheetKeyboard(noteRef)
-  const row = useStore(s => s.S.active?.entries?.[entryIdx]?.sets?.[setIdx])
+  const A = useStore(s => s.S.active)
+  const row = A?.entries?.[entryIdx]?.sets?.[setIdx]
   const update = useStore(s => s.update)
   const [note, setNote] = useState(row?.note || '')
+  const [tags, setTags] = useState(() => cleanSetTags(row?.tags, Infinity))
+  const [draft, setDraft] = useState('')
 
   useEffect(() => { if (!row) close() }, [!row])
   if (!row) return null
 
+  const offered = cleanSetTags([...(A.setTags || []), ...(A.entries || []).flatMap(e => (e.sets || []).flatMap(x => x.tags || [])), ...tags], Infinity)
+  const on = tag => tags.some(x => x.toLowerCase() === tag.toLowerCase())
+  const toggle = tag => setTags(on(tag) ? withoutSetTag(tags, tag) : cleanSetTags([...tags, tag], Infinity))
+  const addLabel = () => {
+    const tag = cleanSetTags([draft])[0]
+    if (!tag) return
+    // A new label joins the workout's list, so the next set offers it too.
+    update(s => { if (s.active) s.active.setTags = withSetTag(s.active.setTags, tag) })
+    if (!on(tag)) setTags(cleanSetTags([...tags, tag], Infinity))
+    setDraft('')
+  }
   const save = () => {
-    const text = note.trim().slice(0, NOTE_MAX)
+    const pending = cleanSetTags([draft])[0]
     update(s => {
       const set = s.active?.entries?.[entryIdx]?.sets?.[setIdx]
       if (!set) return
-      if (text) set.note = text
-      else delete set.note
+      if (pending) s.active.setTags = withSetTag(s.active.setTags, pending)
+      annotateSet(set, { tags: pending ? [...tags, pending] : tags, note })
     }, true)
     close()
   }
 
   return <>
-    <h3>{t('Set note')}</h3>
-    <textarea ref={noteRef} className="input" rows={4} maxLength={NOTE_MAX} value={note}
+    <h3>{t('Annotate set')}</h3>
+    <div className="small muted" style={{ marginBottom: 6 }}>{t('Labels')}</div>
+    {offered.length > 0
+      ? <div className="chips" style={{ flexWrap: 'wrap', overflow: 'visible', touchAction: 'auto', marginBottom: 10 }}>
+        {offered.map(tag => <button key={tag} type="button" className={'chip nocap' + (on(tag) ? ' on' : '')} aria-pressed={on(tag)}
+          onClick={() => toggle(tag)}>{on(tag) && <Icon name="check" />}{tag}</button>)}
+      </div>
+      : <div className="small dim" style={{ marginBottom: 10 }}>{t('This workout has no labels yet. Add one, like Belt or Paused.')}</div>}
+    <div className="row" style={{ gap: 8, marginBottom: 6 }}>
+      <input className="input" type="text" maxLength={SET_TAG_MAX} value={draft} aria-label={t('New label')} placeholder={t('New label')}
+        onChange={e => setDraft(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') addLabel() }} />
+      <Button icon="plus" disabled={!cleanSetTags([draft]).length} onClick={addLabel} style={{ flex: '0 0 auto', width: 'auto' }}>{t('Add')}</Button>
+    </div>
+    <Button variant="ghost" size="sm" icon="pencil" style={{ marginBottom: 14 }} onClick={() => setTagsSheet()}>{t('Edit this workout’s labels')}</Button>
+    <div className="small muted" style={{ marginBottom: 6 }}>{t('Note')}</div>
+    <textarea ref={noteRef} className="input" rows={3} maxLength={NOTE_MAX} value={note}
       placeholder={t('Anything specific to remember about this set.')}
       onFocus={onNoteFocus} onChange={event => setNote(event.target.value)} />
     <div style={{ height: 18 }} />
@@ -3077,6 +3151,67 @@ function SetNote({ entryIdx, setIdx, close }) {
 
 export const setNoteSheet = (entryIdx, setIdx) =>
   ui().openSheet(close => <SetNote entryIdx={entryIdx} setIdx={setIdx} close={close} />)
+
+// The labels a workout offers on its sets (lib/set-tags.js). Two places own such a list: a
+// routine (routine.setTags, edited from the routine editor) and a running session (A.setTags,
+// copied from its routines at the start). Without `routineId` this edits the session's, and can
+// save it back to the routine(s) the session was started from, so the next session of it opens
+// with the same ones. Removing a label takes it off the list only; sets that wear it keep it.
+function SetTagsEditor({ routineId, close }) {
+  const st = useStore(s => s.S)
+  const A = st.active
+  const routine = routineId ? (st.routines || []).find(r => r.id === routineId) : null
+  const gone = routineId ? !routine : !A
+  const [draft, setDraft] = useState('')
+  useEffect(() => { if (gone) close() }, [gone])
+  if (gone) return null
+  const list = cleanSetTags(routine ? routine.setTags : A.setTags)
+  // The list this sheet writes to, on a store draft.
+  const host = s => (routineId ? (s.routines || []).find(r => r.id === routineId) : s.active)
+  const write = (s, next) => { const h = host(s); if (!h) return; if (next.length) h.setTags = next; else delete h.setTags }
+  const rids = routine ? [] : [].concat(A.routineIds || []).filter(id => (st.routines || []).some(r => r.id === id))
+  const full = list.length >= SET_TAGS_MAX
+  const add = () => {
+    const tag = cleanSetTags([draft])[0]
+    if (!tag) return
+    update(s => { write(s, withSetTag(host(s)?.setTags, tag)) })
+    setDraft('')
+  }
+  const remove = tag => update(s => { write(s, withoutSetTag(host(s)?.setTags, tag)) })
+  const saveToRoutine = () => {
+    update(s => {
+      for (const id of rids) {
+        const r = s.routines.find(x => x.id === id)
+        if (!r) continue
+        if (list.length) r.setTags = [...list]; else delete r.setTags
+      }
+    })
+    toast(t('Labels saved to the routine'))
+  }
+  return <>
+    <h3>{t('Set labels')}</h3>
+    <div className="muted small" style={{ marginBottom: 12 }}>
+      {routine ? t('Quick labels for annotating sets in this routine’s workouts, like Belt, Paused or Pain.')
+        : t('Quick labels for annotating sets in this workout. Each routine keeps its own list.')}
+    </div>
+    {list.length > 0
+      ? <div className="chips" style={{ flexWrap: 'wrap', overflow: 'visible', touchAction: 'auto', marginBottom: 12 }}>
+        {list.map(tag => <button key={tag} type="button" className="chip on nocap" aria-label={t('Remove {0}', tag)}
+          onClick={() => remove(tag)}>{tag} <Icon name="xmark" /></button>)}
+      </div>
+      : <div className="small dim" style={{ marginBottom: 12 }}>{t('No labels yet.')}</div>}
+    <div className="row" style={{ gap: 8, marginBottom: 12 }}>
+      <input className="input" type="text" maxLength={SET_TAG_MAX} value={draft} disabled={full} aria-label={t('New label')} placeholder={t('New label')}
+        onChange={e => setDraft(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') add() }} />
+      <Button icon="plus" disabled={full || !cleanSetTags([draft]).length} onClick={add} style={{ flex: '0 0 auto', width: 'auto' }}>{t('Add')}</Button>
+    </div>
+    {rids.length > 0 && !A.editingWorkoutId && <Button icon="clipboard" onClick={saveToRoutine} style={{ marginBottom: 8 }}>{t('Save to routine')}</Button>}
+    <Button variant="primary" onClick={close}>{t('Done')}</Button>
+  </>
+}
+/** The running session's labels, or with `routineId` that routine's own. */
+export const setTagsSheet = routineId => ui().openSheet(close => <SetTagsEditor routineId={typeof routineId === 'string' ? routineId : null} close={close} />)
+
 
 /* The session note: how the whole workout went, as opposed to how one exercise went. It lives
    on the active session, so buildCompletedWorkout carries it onto the finished workout and it

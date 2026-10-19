@@ -21,6 +21,7 @@ import { t, exerciseNameFor, exerciseNameClass, getLang, RTL_LANGS } from './i18
 import { convertWeight } from './units.js'
 import { fmtSpeed, speedUnitOf } from './speed.js'
 import { MUSCLES, inMuscleOrder } from './muscles.js'
+import { cleanSetTags } from './set-tags.js'
 
 const PLAN_FMT = 1
 const WEEK_DAYS = [1, 2, 3, 4, 5, 6, 0]   // every getDay() index; only the reader's own
@@ -197,6 +198,8 @@ export function buildPlanBundle(S, name) {
     id: r.id, name: r.name, emoji: r.emoji,
     ...(r.prog ? { prog: r.prog } : {}),
     ...(r.excludeFromProgression === true ? { excludeFromProgression: true } : {}),
+    // The routine's set annotation labels (lib/set-tags.js) are part of the plan.
+    ...(cleanSetTags(r.setTags).length ? { setTags: cleanSetTags(r.setTags) } : {}),
     ex: (r.ex || []).map(cleanEx)
   }))
   const usedIds = new Set(routines.flatMap(r => r.ex.map(e => e.id)))
@@ -304,6 +307,7 @@ export function mergePlan(s, bundle, { schedule } = {}) {
       emoji: r.emoji,
       ...(r.prog ? { prog: r.prog } : {}),
       ...(r.excludeFromProgression === true ? { excludeFromProgression: true } : {}),
+      ...(cleanSetTags(r.setTags).length ? { setTags: cleanSetTags(r.setTags) } : {}),
       ex: (r.ex || []).map(e => ({ ...e, id: exIdMap[e.id] || canonicalExId(e.id) }))
     })
   })

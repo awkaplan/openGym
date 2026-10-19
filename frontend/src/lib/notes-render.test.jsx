@@ -7,7 +7,7 @@ import React, { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { useStore } from '../store/useStore.js'
 import { useUI } from '../store/useUI.js'
-import { exerciseNoteSheet, setNoteSheet } from '../sheets.jsx'
+import { exerciseNoteSheet, setNoteSheet, setTagsSheet } from '../sheets.jsx'
 
 const activeWith = entry => ({ id: 'w1', d: '2026-08-25', start: 1, routineId: 'r1', name: 'Push', entries: [entry] })
 
@@ -27,6 +27,16 @@ function renderSheet() {
 }
 function renderSetNoteSheet(entryIdx = 0, setIdx = 0) {
   setNoteSheet(entryIdx, setIdx)
+  const sheet = useUI.getState().sheets.at(-1)
+  const host = document.createElement('div')
+  document.body.appendChild(host)
+  const root = createRoot(host)
+  mounted.push(root)
+  act(() => root.render(sheet.render(sheet_close(sheet))))
+  return host
+}
+function renderTagsSheet(routineId) {
+  setTagsSheet(routineId)
   const sheet = useUI.getState().sheets.at(-1)
   const host = document.createElement('div')
   document.body.appendChild(host)
@@ -111,5 +121,48 @@ describe('exercise note sheet', () => {
     act(() => { type(host.querySelector('textarea'), '') })
     act(() => { [...host.querySelectorAll('button')].find(b => b.textContent === 'Save').click() })
     expect(useStore.getState().S.active.entries[0].sets[0].note).toBeUndefined()
+  })
+
+  it('ticks the workout’s labels on a set, and adds a new one to the workout’s list', () => {
+    useStore.setState(s => ({
+      S: { ...s.S, active: { ...activeWith({ id: 'bench', sets: [{ w: 60, r: 5, done: true }] }), setTags: ['Belt', 'Paused'] } },
+    }))
+    const host = renderSetNoteSheet()
+    const chip = label => [...host.querySelectorAll('button.chip')].find(b => b.textContent === label)
+    expect(chip('Belt')).toBeTruthy()
+    expect(chip('Paused')).toBeTruthy()
+    act(() => { chip('Belt').click() })
+    expect(chip('Belt').getAttribute('aria-pressed')).toBe('true')
+    // A label of your own, typed and added: ticked on this set and kept on the workout's list.
+    act(() => { type(host.querySelector('input[aria-label="New label"]'), 'Wraps') })
+    act(() => { [...host.querySelectorAll('button')].find(b => b.textContent === 'Add').click() })
+    expect(useStore.getState().S.active.setTags).toEqual(['Belt', 'Paused', 'Wraps'])
+    act(() => { [...host.querySelectorAll('button')].find(b => b.textContent === 'Save').click() })
+    const set = useStore.getState().S.active.entries[0].sets[0]
+    expect(set.tags).toEqual(['Belt', 'Wraps'])
+    expect(set.note).toBeUndefined()
+  })
+
+  it('edits a routine’s own label list', () => {
+    useStore.setState(s => ({
+      S: { ...s.S, active: null, routines: [{ id: 'r1', name: 'Squat day', ex: [], setTags: ['Belt'] }] },
+    }))
+    const host = renderTagsSheet('r1')
+    act(() => { type(host.querySelector('input[aria-label="New label"]'), ' Knee sleeves ') })
+    act(() => { [...host.querySelectorAll('button')].find(b => b.textContent === 'Add').click() })
+    expect(useStore.getState().S.routines[0].setTags).toEqual(['Belt', 'Knee sleeves'])
+    act(() => { host.querySelector('button[aria-label="Remove Belt"]').click() })
+    act(() => { host.querySelector('button[aria-label="Remove Knee sleeves"]').click() })
+    // An empty list is no key at all, so the routine reads as it did before labels existed.
+    expect('setTags' in useStore.getState().S.routines[0]).toBe(false)
+  })
+
+  it('saves a session’s labels back to its routine', () => {
+    useStore.setState(s => ({
+      S: { ...s.S, routines: [{ id: 'r1', name: 'Push', ex: [] }], active: { ...activeWith({ id: 'bench', sets: [] }), routineIds: ['r1'], setTags: ['Belt'] } },
+    }))
+    const host = renderTagsSheet()
+    act(() => { [...host.querySelectorAll('button')].find(b => b.textContent === 'Save to routine').click() })
+    expect(useStore.getState().S.routines[0].setTags).toEqual(['Belt'])
   })
 })

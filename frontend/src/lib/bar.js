@@ -30,6 +30,51 @@ export const usesBar = exOrId => BAR_EQ.has(exOf(exOrId)?.eq)
 export const defaultBarWeight = (eq, unit) =>
   (unit === 'lb' ? DEFAULT_BAR_LB : DEFAULT_BAR_KG)[eq] ?? null
 
+// Your own bar, for every workout (Settings → Equipment → Bar weights). A gym whose barbells are
+// 15 kg, or a home bar of 35 lb, should not take one override per exercise:
+//
+//   S.barDefaults = { barbell: 15, 'ez barbell': 7.5 }
+//
+// keyed by bar type, in the profile unit like every other weight (a unit switch converts it,
+// lib/units.js). An exercise's own S.barWeights entry still wins over it. An "olympic barbell"
+// exercise is done on the same bar as a "barbell" one, so it follows the barbell's weight unless
+// it has its own. 0 is a real answer here too: every Smith machine in your gym is counterbalanced.
+
+/** The bar types the settings list, in order: the olympic bar rides on the barbell's line. */
+export const BAR_TYPES = ['barbell', 'ez barbell', 'smith machine', 'trap bar']
+
+const ownDefault = (S, eq) => {
+  const map = S?.barDefaults
+  if (!map || typeof map !== 'object') return null
+  const v = map[eq] ?? (eq === 'olympic barbell' ? map.barbell : undefined)
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null
+}
+
+/** Whether the profile has set its own weight for this bar type (0 included). */
+export const hasOwnBarDefault = (S, eq) => ownDefault(S, eq) != null
+
+/**
+ * The bar weight an exercise on this equipment starts from when it has no override of its own:
+ * the profile's own (S.barDefaults), else the standard bar for the unit. null off the list.
+ */
+export function standardBarWeight(S, eq) {
+  if (!BAR_EQ.has(eq)) return null
+  const own = ownDefault(S, eq)
+  return own != null ? own : defaultBarWeight(eq, S?.unit)
+}
+
+/**
+ * S.barDefaults with `eq` set to `v`, as a new object. A value equal to the standard bar (or
+ * not a number ≥ 0) takes the key away, so the profile follows the standard again.
+ */
+export function withBarDefault(map, eq, v, unit) {
+  const out = { ...(map && typeof map === 'object' ? map : {}) }
+  const n = typeof v === 'number' && Number.isFinite(v) ? Math.round(v * 100) / 100 : NaN
+  if (!BAR_TYPES.includes(eq) || !(n >= 0) || n === defaultBarWeight(eq, unit)) delete out[eq]
+  else out[eq] = n
+  return out
+}
+
 /**
  * A stored 0 is "no bar", not "unset" (issue #138). Smith machines that counterbalance their
  * carriage put nothing in your hands, so the plate math and the drop-set steps have to start
@@ -48,7 +93,8 @@ export const hasBarOverride = (S, exId) => {
 /**
  * Effective bar weight for one exercise, in the profile unit: the explicit
  * S.barWeights[exId] if set — an explicit 0 is "no bar" (a Smith machine whose carriage is
- * counterbalanced, issue #138) and stays 0 — else the default for the bar type. null for
+ * counterbalanced, issue #138) and stays 0 — else the profile's own bar for the type
+ * (S.barDefaults), else the standard one. null for
  * anything that is not a bar exercise.
  */
 export function barWeightFor(S, exOrId) {
@@ -57,7 +103,7 @@ export function barWeightFor(S, exOrId) {
   const own = (S?.barWeights || {})[ex.id]
   if (own === 0) return 0
   if (own > 0) return own
-  return defaultBarWeight(ex.eq, S?.unit)
+  return standardBarWeight(S, ex.eq)
 }
 
 /**

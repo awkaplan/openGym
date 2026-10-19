@@ -99,6 +99,7 @@ vi.mock('../sheets.jsx', () => ({
   // sessionNoteSheet during render, so a missing export is a render crash, not a no-op.
   exerciseNoteSheet: vi.fn(),
   setNoteSheet: mocks.setNoteSheet,
+  setTagsSheet: vi.fn(),
   sessionNoteSheet: vi.fn(),
   renameWorkoutSheet: mocks.renameWorkoutSheet,
   effortPickerSheet: mocks.effortPickerSheet,
@@ -2350,7 +2351,7 @@ describe('workout view header menu', () => {
     const menu = await openMenu()
     expect(menu.sections.map(g => g.title)).toEqual([undefined, 'Add', 'This workout', undefined])
     expect(menuItemsOf(menu).map(it => it.label)).toEqual([
-      'Workout settings', 'Add exercise', 'Add routine', 'Rename workout', 'Layout', 'Add session note', 'Don’t count for progression', 'Discard workout',
+      'Workout settings', 'Add exercise', 'Add routine', 'Rename workout', 'Layout', 'Add session note', 'Set labels', 'Don’t count for progression', 'Discard workout',
     ])
     expect(item(menu, 'Workout settings').sub).toBe('1:30 rest · Silent')
     expect(item(menu, 'Discard workout').danger).toBe(true)
@@ -2856,8 +2857,11 @@ describe('workout controls: the more menu and the set menu', () => {
   it('opens a per-set menu from the set number with drop, burst and remove', async () => {
     await mount([exercise('plain-bench', [false, false])])
     await act(async () => { container.querySelector('button[aria-label="Set 2"]').dispatchEvent(new dom.Event('click', { bubbles: true })) })
-    expect(menuItemsOf(lastMenu()).map(it => it.label)).toEqual(['Make it a warm-up set', 'Taken to failure', 'Drop set', 'Rest-pause burst', 'Copy this set', 'Remove this set'])
+    expect(menuItemsOf(lastMenu()).map(it => it.label)).toEqual(['Make it a warm-up set', 'Taken to failure', 'Annotate set', 'Drop set', 'Rest-pause burst', 'Copy this set', 'Remove this set'])
     expect(item('Make it a warm-up set').icon).toBe('sunrise')
+    // Annotating opens the set's own sheet, for that exercise and row.
+    item('Annotate set').onClick()
+    expect(mocks.setNoteSheet).toHaveBeenCalledWith(0, 1)
 
     await act(async () => { item('Drop set').onClick() })
     expect(mocks.S.active.entries[0].sets[1].drops?.length).toBe(1)
@@ -2865,6 +2869,20 @@ describe('workout controls: the more menu and the set menu', () => {
     await act(async () => { container.querySelector('button[aria-label="Set 2"]').dispatchEvent(new dom.Event('click', { bubbles: true })) })
     await act(async () => { item('Remove this set').onClick() })
     expect(mocks.S.active.entries[0].sets.length).toBe(1)
+  })
+
+  it('shows a set’s annotation under its row, and the menu offers to edit it', async () => {
+    const ex = exercise('plain-bench', [true, false])
+    ex.sets[0].tags = ['Belt', 'Paused']
+    ex.sets[0].note = 'felt fast'
+    await mount([ex])
+    const line = container.querySelector('.setnote')
+    expect(line?.textContent).toBe('Belt, Paused · felt fast')
+    expect(container.querySelectorAll('.setnote').length).toBe(1)
+    await act(async () => { line.dispatchEvent(new dom.Event('click', { bubbles: true })) })
+    expect(mocks.setNoteSheet).toHaveBeenCalledWith(0, 0)
+    await act(async () => { container.querySelector('button[aria-label="Set 1"]').dispatchEvent(new dom.Event('click', { bubbles: true })) })
+    expect(item('Edit annotation').sub).toBe('Belt, Paused · felt fast')
   })
 
   it('marks a set as taken to failure from its menu, with an F on its number, and back', async () => {

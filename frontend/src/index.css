@@ -655,6 +655,13 @@ body.chips-dragging *{cursor:inherit}
   background:var(--surface);border-radius:var(--r);padding:13px 15px;
   line-height:1.45;white-space:pre-wrap;font-size:15px;margin-bottom:10px;color:var(--label-2);
 }
+/* A set's annotations (lib/set-tags.js), under its row: a tap opens them to edit. */
+.setnote{
+  display:flex;align-items:flex-start;gap:6px;width:100%;margin:-2px 0 6px;padding:2px 4px 2px 42px;
+  background:none;border:0;color:var(--label-2);font:inherit;font-size:13px;line-height:1.35;text-align:start;cursor:pointer;
+}
+.setnote .icn{flex:none;font-size:12px;margin-top:2px;color:var(--acc)}
+.setnote span{min-width:0;overflow-wrap:anywhere}
 
 /* --- search field --- */
 .searchf{position:relative;display:flex;align-items:center}

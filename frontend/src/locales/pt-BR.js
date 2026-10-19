@@ -1410,6 +1410,13 @@ export const PT_BR_OVERRIDES = {
   'Gentle, for headphones or a quiet room.': 'Suave, para fones de ouvido ou um lugar silencioso.',
   'Fewer than two workouts in this period. Pick a longer one.': 'Menos de dois treinos neste período. Escolha um mais longo.',
   'Releases are checked on GitHub. The download is verified against its checksum before the installer opens.': 'As versões são verificadas no GitHub. O download é conferido pela soma de verificação antes de abrir o instalador.',
+  // --- bar weights for every workout, set annotations ---
+  'The bar every workout starts from, for the plate math and the lightest warm-up. An exercise with its own bar keeps it.': 'A barra da qual cada treino parte, para o cálculo das anilhas e o aquecimento mais leve. Um exercício com barra própria continua com ela.',
+  'Yours. The standard bar is {0}.': 'Sua. A barra padrão pesa {0}.',
+  'This workout has no labels yet. Add one, like Belt or Paused.': 'Este treino ainda não tem etiquetas. Adicione uma, como Cinto ou Pausa.',
+  'Labels saved to the routine': 'Etiquetas salvas na rotina',
+  'Quick labels for annotating sets in this workout. Each routine keeps its own list.': 'Etiquetas rápidas para anotar séries neste treino. Cada rotina tem sua própria lista.',
+  'Save to routine': 'Salvar na rotina',
 }
 
 export default { ...pt, ...PT_BR_OVERRIDES }

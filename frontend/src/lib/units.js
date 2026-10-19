@@ -5,7 +5,7 @@
 import { isSideSet, syncSideAggregate } from './workout-model.js'
 import { workoutVolume } from './history.js'
 import { EXIDX } from './exercises.js'
-import { defaultBarWeight } from './bar.js'
+import { defaultBarWeight, BAR_TYPES } from './bar.js'
 
 const LB_PER_KG = 2.2046226218
 
@@ -64,6 +64,19 @@ const convBarWeights = (bw, from, to) => {
   }
   return out
 }
+// The profile's own bar per type (lib/bar.js S.barDefaults) converts the same way: a 15 kg bar
+// is the 33 lb bar, 0 stays 0, and one that lands on the new unit's standard bar drops out.
+const convBarDefaults = (map, from, to) => {
+  const out = {}
+  for (const [eq, v] of Object.entries(map || {})) {
+    if (!BAR_TYPES.includes(eq) || typeof v !== 'number' || !Number.isFinite(v) || v < 0) continue
+    if (v === 0) { out[eq] = 0; continue }
+    const c = convertWeight(v, from, to)
+    if (c === defaultBarWeight(eq, to)) continue
+    out[eq] = c
+  }
+  return out
+}
 const convEntry = (e, from, to) => {
   if (!e || typeof e !== 'object') return e
   return {
@@ -97,6 +110,7 @@ export function convertStateUnit(S, to) {
   if (S.targetW != null) out.targetW = bw(S.targetW)
   if (S.exWeights) out.exWeights = Object.fromEntries(Object.entries(S.exWeights).map(([k, v]) => [k, v && typeof v === 'object' ? { ...v, w: c(v.w) } : c(v)]))
   if (S.barWeights) out.barWeights = convBarWeights(S.barWeights, from, to)
+  if (S.barDefaults) out.barDefaults = convBarDefaults(S.barDefaults, from, to)
   // The plate inventory (S.plates) is carried over as it is, not converted: it is kept per unit
   // (lib/plates.js), because a 45 lb plate does not become a 20.4 kg one. After the switch the
   // rows load from the new unit's own list, or the standard set until you count yours, and
